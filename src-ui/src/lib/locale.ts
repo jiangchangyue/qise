@@ -54,6 +54,7 @@ export function verdictLabel(locale: Locale, verdict?: string | null): string {
   const normalized = (verdict || "pass").toLowerCase();
   if (normalized === "block") return tr(locale, "block", "拦截");
   if (normalized === "warn") return tr(locale, "warn", "告警");
+  if (normalized === "info") return tr(locale, "Info", "提示");
   return tr(locale, "pass", "通过");
 }
 
@@ -73,7 +74,8 @@ export function pipelineLabel(locale: Locale, pipeline?: string | null): string 
   return pipeline || tr(locale, "unknown", "未知");
 }
 
-export function agentStatusLabel(locale: Locale, state: "protected" | "available" | "missing"): string {
+export function agentStatusLabel(locale: Locale, state: "protected" | "needs_attention" | "available" | "missing"): string {
+  if (state === "needs_attention") return tr(locale, "Needs attention", "保护需修复");
   if (state === "protected") return tr(locale, "Protected", "已保护");
   if (state === "available") return tr(locale, "Available", "可用");
   return tr(locale, "Not found", "未发现");

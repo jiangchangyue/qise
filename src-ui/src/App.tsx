@@ -15,11 +15,14 @@ import {
   GuardInfo,
   ProtectedAgentRecord,
   SecurityEvent,
+  agentStatus,
+  normalizeAgentInfo,
   normalizeSecurityEvent,
   normalizeStatus,
   slmLabel,
   slmTone,
   statusEventCounts,
+  statusHasConfiguredAgents,
   statusProtectionEnabled,
 } from "./lib/api";
 import {
@@ -152,16 +155,16 @@ const FEATURES: FeatureItem[] = [
   {
     id: "preflight",
     glyph: "PF",
-    title: { en: "Preflight Scan", zh: "上线前扫描" },
-    subtitle: { en: "Scan before you trust it", zh: "启用前先验证" },
+    title: { en: "Safety Check", zh: "安全体检" },
+    subtitle: { en: "Check your Agent setup", zh: "一键检查智能体风险" },
     summary: { en: "Skill, MCP and Agent config checks", zh: "检查技能、协议服务与智能体配置" },
     accent: "var(--qise-blue)",
   },
   {
     id: "shield",
     glyph: "AS",
-    title: { en: "Agent Shield", zh: "智能体防护" },
-    subtitle: { en: "Protect your Agent", zh: "接管并保护智能体" },
+    title: { en: "Smart Protection", zh: "智能保护" },
+    subtitle: { en: "Protect your connected Agents", zh: "为已接入的智能体开启保护" },
     summary: { en: "Codex, OpenClaw, Claude Code, custom", zh: "支持 Codex、OpenClaw、Claude Code 与自定义智能体" },
     accent: "var(--qise-green)",
   },
@@ -184,8 +187,8 @@ const FEATURES: FeatureItem[] = [
   {
     id: "slm",
     glyph: "AI",
-    title: { en: "Local SLM", zh: "本地小模型" },
-    subtitle: { en: "Optional second layer", zh: "可选的第二层审查" },
+    title: { en: "Enhanced Detection", zh: "增强检测（可选）" },
+    subtitle: { en: "Optional model review", zh: "按需启用模型审查" },
     summary: { en: "Ollama or OpenAI-compatible model", zh: "支持 Ollama 或兼容接口模型" },
     accent: "var(--qise-blue)",
   },
@@ -337,6 +340,8 @@ function badgeClass(verdict?: string): string {
       return "badge-block";
     case "warn":
       return "badge-warn";
+    case "info":
+      return "badge-info";
     default:
       return "badge-pass";
   }
@@ -761,13 +766,15 @@ function TopBar({
   );
 }
 
-function HomePage({
+export function HomePage({
   status,
   guards,
   agents,
   onOpen,
   onDetectAgents,
+  onQuickScan,
   detectingAgents,
+  scanning,
   locale,
 }: {
   status: AppStatus | null;
@@ -775,29 +782,44 @@ function HomePage({
   agents: AgentInfo[];
   onOpen: (page: PageId) => void;
   onDetectAgents: () => void;
+  onQuickScan: () => void;
   detectingAgents: boolean;
+  scanning: boolean;
   locale: Locale;
 }) {
   const protectedEnabled = statusProtectionEnabled(status);
   const counts = statusEventCounts(status);
   const slmState = slmLabel(status);
   const slmStateTone = slmTone(status);
-  const installedAgents = agents.filter((agent) => agent.installed);
+  const installedAgents = agents.filter((agent) => agent.installed || agent.configured);
   const protectedAgents = agents.filter((agent) => agent.protected);
 
   const featureBadges: Partial<Record<PageId, string>> = {
     events: `${counts.blocked}/${counts.warnings}`,
-    rules: `${guards.length || 14}`,
+    rules: `${guards.length}`,
     slm: slmStatusLabel(locale, slmState),
     shield: `${protectedAgents.length}/${installedAgents.length || agents.length || 0}`,
     backup: `${Object.keys(status?.protected_agents ?? {}).length}`,
   };
 
   const STATUS_GLYPH = protectedEnabled ? "\u{1F6E1}" : "⚠";
-  const mainStatus = protectedEnabled ? tr(locale, "Protection is on", "保护已开启") : tr(locale, "Protection needs setup", "保护需要设置");
+  const needsAttention = statusHasConfiguredAgents(status) && !protectedEnabled;
+  const servicesReady = status?.services_running === true;
+  const mainStatus = !status
+    ? tr(locale, "Checking protection status", "保护状态待确认")
+    : protectedEnabled ? tr(locale, "Smart protection is on", "智能保护已开启")
+      : needsAttention ? tr(locale, "Protection needs attention", "保护需要修复")
+        : servicesReady ? tr(locale, "Services ready, awaiting connection", "服务已就绪，等待接入")
+        : tr(locale, "Smart protection is off", "智能保护未开启");
   const statusDetail = protectedEnabled
-    ? tr(locale, `${protectedAgents.length} agents protected · Blocked ${counts.blocked} threats today · ${counts.warnings} warnings`, `已保护 ${protectedAgents.length} 个智能体 · 今日拦截 ${counts.blocked} 次威胁 · ${counts.warnings} 条告警`)
-    : tr(locale, `${installedAgents.length || agents.length || 0} agents detected · Run Preflight or protect an Agent to start`, `已检测到 ${installedAgents.length || agents.length || 0} 个智能体 · 运行上线前扫描或保护智能体后开始`);
+    ? tr(locale, `${protectedAgents.length} agents protected · ${counts.blocked} blocks and ${counts.warnings} warnings in the last 24 hours`, `已保护 ${protectedAgents.length} 个智能体 · 近 24 小时拦截 ${counts.blocked} 次、提醒 ${counts.warnings} 次`)
+    : needsAttention
+      ? tr(locale, "A saved connection needs attention. Open Smart Protection to restore or reconnect it.", "已有接入配置需要处理。请打开智能保护，恢复原设置或重新接入。")
+      : servicesReady
+        ? tr(locale, "The local services are running. No supported agent route has been verified; manual connections need your own check.", "本地服务正在运行，尚未确认受支持的智能体接入；手动接入需自行检查路由。")
+        : status?.services_running === false
+          ? tr(locale, `Protection services are stopped · ${installedAgents.length} agents detected · Start with a safety check`, `保护服务已停止 · 已检测到 ${installedAgents.length} 个智能体 · 建议先做一次安全体检`)
+          : tr(locale, `${installedAgents.length} agents detected · Start with a safety check`, `已检测到 ${installedAgents.length} 个智能体 · 建议先做一次安全体检`);
 
   const coreFeatures = FEATURES.filter((f) =>
     ["preflight", "shield", "events", "slm"].includes(f.id)
@@ -850,18 +872,19 @@ function HomePage({
               <h2 className="text-3xl font-bold text-[var(--text-primary)]">{mainStatus}</h2>
               <p className="mt-2 text-base text-[var(--text-secondary)]">{statusDetail}</p>
               <p className="mt-2 text-sm text-[var(--text-dim)]">
-                {slmStateTone === "ready"
+                {protectedEnabled ? slmStateTone === "ready"
                   ? tr(locale, "The local-first guard pipeline is running with model review.", "本地优先的守卫流水线正在使用模型审查。")
-                  : tr(locale, "The local-first guard pipeline is active in rules-only mode.", "本地优先的守卫流水线正在以纯规则模式运行。")}
+                  : tr(locale, "Protection is running with local rules. Enhanced detection is optional.", "当前使用本地规则保护。增强检测可按需开启。")
+                  : tr(locale, "A safety check reviews your setup. Runtime protection starts after an Agent is connected.", "安全体检会检查当前配置；接入智能体后才会开启运行时保护。")}
               </p>
             </div>
           </div>
           <div className="flex shrink-0 flex-wrap gap-3 md:justify-end">
-            <BusyButton locale={locale} variant="primary" busy={detectingAgents} busyLabel={tr(locale, "Detecting...", "正在检测...")} onClick={onDetectAgents}>
-              {tr(locale, "Detect Agents", "检测智能体")}
+            <BusyButton locale={locale} variant="primary" busy={scanning} busyLabel={tr(locale, "Checking...", "正在体检...")} onClick={onQuickScan}>
+              {tr(locale, "Run Safety Check", "一键安全体检")}
             </BusyButton>
-            <BusyButton locale={locale} variant="secondary" onClick={() => onOpen("preflight")}>
-              {tr(locale, "Preflight Scan", "上线前扫描")}
+            <BusyButton locale={locale} variant="secondary" onClick={() => onOpen("shield")}>
+              {tr(locale, "Smart Protection", "智能保护")}
             </BusyButton>
           </div>
         </div>
@@ -873,7 +896,7 @@ function HomePage({
           <div>
             <div className="qise-section-label mb-0">{tr(locale, "Detected Agents", "已检测智能体")}</div>
             <p className="mt-1 text-sm text-[var(--text-tertiary)]">
-              {tr(locale, "Only agents detected on this device are shown here.", "这里只显示当前设备实际检测到的智能体。")}
+              {tr(locale, "Agents detected on this device and existing connections that may need recovery.", "显示本机检测到的智能体，以及可能需要恢复的已有接入。")}
             </p>
           </div>
           <BusyButton locale={locale} variant="secondary" busy={detectingAgents} busyLabel={tr(locale, "Detecting...", "正在检测...")} onClick={onDetectAgents}>
@@ -884,11 +907,7 @@ function HomePage({
           <div className="grid gap-4 md:grid-cols-3">
             {installedAgents.map((agent) => {
             const dotClass = agent.protected ? "qise-agent-dot-green" : agent.installed ? "qise-agent-dot-yellow" : "qise-agent-dot-muted";
-            const statusLabel = agent.protected
-              ? agentStatusLabel(locale, "protected")
-              : agent.installed
-                ? agentStatusLabel(locale, "available")
-                : agentStatusLabel(locale, "missing");
+            const statusLabel = agentStatusLabel(locale, agentStatus(agent));
 
             return (
               <button key={agent.key} className="qise-agent-card group" onClick={() => onOpen("shield")}>
@@ -1410,11 +1429,13 @@ function EventsPage({ events, onEvent, locale }: { events: SecurityEvent[]; onEv
 
 function RulesPage({
   guards,
+  loadError,
   onSetGuardMode,
   setError,
   locale,
 }: {
   guards: GuardInfo[];
+  loadError: string | null;
   onSetGuardMode: (guardName: string, mode: string) => Promise<void>;
   setError: (error: string | null) => void;
   locale: Locale;
@@ -1444,7 +1465,7 @@ function RulesPage({
       <div className="qise-card flex flex-wrap items-center justify-between gap-4 p-4">
         <div>
           <h3 className="text-sm font-semibold uppercase text-[var(--text-primary)]">{tr(locale, "Global Presets", "全局预设")}</h3>
-          <p className="text-xs text-[var(--text-tertiary)]">{tr(locale, "Changing runtime modes requires the Qise bridge to be available.", "切换运行模式需要 Qise 桥接服务可用。")}</p>
+          <p className="text-xs text-[var(--text-tertiary)]">{tr(locale, "Changes are saved and apply to the next check, including after a restart.", "调整会保存，并从下一次检查开始生效；重启后仍会保留。")}</p>
         </div>
         <div className="flex flex-wrap gap-2">
           {(["balanced", "strict", "observe"] as GuardPreset[]).map((preset) => (
@@ -1458,7 +1479,7 @@ function RulesPage({
               locale={locale}
             >
               {preset === "balanced"
-                ? tr(locale, "Balanced", "均衡")
+                ? tr(locale, "Smart Protection", "智能保护")
                 : preset === "strict"
                   ? tr(locale, "Strict", "严格")
                   : modeLabel(locale, preset)}
@@ -1466,6 +1487,10 @@ function RulesPage({
           ))}
         </div>
       </div>
+      {loadError && <p role="alert" className="qise-card p-4 text-sm text-qise-red">{loadError}</p>}
+      {!loadError && guards.length === 0 && (
+        <p className="qise-card p-4 text-sm text-[var(--text-tertiary)]">{tr(locale, "No protection rules loaded.", "尚未加载防护规则。")}</p>
+      )}
       <GuardList guards={guards} onSetMode={onSetGuardMode} locale={locale} />
     </div>
   );
@@ -1486,7 +1511,7 @@ function SlmPage({
   onCheckSlm: () => void;
   locale: Locale;
 }) {
-  const [model, setModel] = useState(status?.slm?.model || "qwen3:4b");
+  const [model, setModel] = useState(status?.slm?.model || "");
   const [baseUrl, setBaseUrl] = useState(status?.slm?.base_url || "http://localhost:11434/v1");
   const [apiKey, setApiKey] = useState("");
   const [timeoutMs, setTimeoutMs] = useState(10000);
@@ -1502,7 +1527,7 @@ function SlmPage({
       <section className="qise-card p-5">
         <h3 className="text-sm font-semibold uppercase text-[var(--text-primary)]">{tr(locale, "Quick Setup", "快速设置")}</h3>
         <p className="mt-2 text-sm leading-6 text-[var(--text-secondary)]">
-          {tr(locale, "The local small model is optional. By default Qise will prepare Ollama and pull the model if they are missing.", "本地小模型是可选项。默认情况下，如果缺少 Ollama 或模型，Qise 会尝试准备它们。")}
+          {tr(locale, "Enhanced detection is optional. Choose a model, then start setup when you are ready. Setup may install Ollama and download the model.", "增强检测是可选项。填写模型后，再按需启动设置；此操作可能安装 Ollama 并下载模型。")}
         </p>
         <div className="mt-4 space-y-3">
           <label className="block">
@@ -1511,11 +1536,11 @@ function SlmPage({
           </label>
           <label className="block">
             <span className="text-xs text-[var(--text-tertiary)]">{tr(locale, "Model", "模型")}</span>
-            <input className="qise-input" value={model} onChange={(event) => setModel(event.target.value)} />
+            <input className="qise-input" value={model} onChange={(event) => setModel(event.target.value)} placeholder="qwen3:4b" />
           </label>
           <label className="block">
             <span className="text-xs text-[var(--text-tertiary)]">{tr(locale, "API key", "接口密钥")}</span>
-            <input className="qise-input" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={tr(locale, "Optional", "可选")} />
+            <input className="qise-input" type="password" value={apiKey} onChange={(event) => setApiKey(event.target.value)} placeholder={tr(locale, "Optional", "可选")} />
           </label>
           <label className="block">
             <span className="text-xs text-[var(--text-tertiary)]">{tr(locale, "Timeout ms", "超时毫秒")}</span>
@@ -1538,7 +1563,7 @@ function SlmPage({
           <BusyButton
             busy={busy && task.action === "start"}
             busyLabel={tr(locale, "Starting...", "正在启动...")}
-            disabled={busy}
+            disabled={busy || !model.trim() || !baseUrl.trim()}
             onClick={() => onStartSlm({ model, baseUrl, apiKey, timeoutMs, noInstall, noPull, noVerify })}
             locale={locale}
           >
@@ -1816,6 +1841,7 @@ function App() {
   const [status, setStatus] = useState<AppStatus | null>(null);
   const [statusResolved, setStatusResolved] = useState(false);
   const [guards, setGuards] = useState<GuardInfo[]>([]);
+  const [guardsError, setGuardsError] = useState<string | null>(null);
   const [events, setEvents] = useState<SecurityEvent[]>([]);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -1835,7 +1861,7 @@ function App() {
   const appUpdater = useAppUpdater(
     {
       known: statusResolved && status !== null,
-      enabled: status === null || statusProtectionEnabled(status),
+      enabled: status === null || statusProtectionEnabled(status) || statusHasConfiguredAgents(status),
     },
     statusResolved,
   );
@@ -1857,8 +1883,13 @@ function App() {
       if (nextStatus.detected_agents) {
         setAgents(nextStatus.detected_agents);
       }
-      setLastError(null);
     } catch (e) {
+      setStatus(null);
+      setAgents((previous) => previous.map((agent) => ({
+        ...agent,
+        protected: false,
+        protection_status: agent.configured ? "needs_attention" : "not_protected",
+      })));
       setLastError(String(e));
     } finally {
       statusInFlight.current = false;
@@ -1872,7 +1903,10 @@ function App() {
     try {
       const nextGuards = await invoke<GuardInfo[]>("get_guards");
       setGuards(nextGuards);
+      setGuardsError(null);
     } catch (e) {
+      setGuards([]);
+      setGuardsError(String(e));
       setLastError(String(e));
     }
   }, []);
@@ -1932,8 +1966,8 @@ function App() {
     setDetectingAgents(true);
     setLastError(null);
     try {
-      const detected = await invoke<AgentInfo[]>("detect_agents");
-      setAgents(detected);
+      const detected = await invoke<unknown[]>("detect_agents");
+      setAgents(detected.map(normalizeAgentInfo));
       await loadStatus();
     } catch (e) {
       setLastError(String(e));
@@ -1960,7 +1994,16 @@ function App() {
       await loadGuards();
     } catch (e) {
       setLastError(String(e));
+      throw e;
     }
+  }
+
+  function runQuickScan() {
+    setActivePage("preflight");
+    runPreflightScan({
+      mode: "all", path: "", agent: "", selectedAgents: [],
+      includeSkills: true, includeMcp: true, includeAgentConfig: true,
+    });
   }
 
   function runPreflightScan(request: PreflightRequest) {
@@ -2160,7 +2203,9 @@ function App() {
             agents={agents}
             onOpen={setActivePage}
             onDetectAgents={detectAgentsNow}
+            onQuickScan={runQuickScan}
             detectingAgents={detectingAgents}
+            scanning={preflightTask.status === "running"}
             locale={locale}
           />
         )}
@@ -2181,7 +2226,7 @@ function App() {
         )}
         {activePage === "events" && <EventsPage events={events} onEvent={handleEvent} locale={locale} />}
         {activePage === "rules" && (
-          <RulesPage guards={guards} onSetGuardMode={handleSetGuardMode} setError={setLastError} locale={locale} />
+          <RulesPage guards={guards} loadError={guardsError} onSetGuardMode={handleSetGuardMode} setError={setLastError} locale={locale} />
         )}
         {activePage === "slm" && (
           <SlmPage status={status} task={slmTask} onStartSlm={startSlmTask} onStopSlm={stopSlmTask} onCheckSlm={checkSlmTask} locale={locale} />

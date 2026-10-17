@@ -127,6 +127,7 @@ class ContextGuardRuleChecker(RuleChecker):
                 verdict=GuardVerdict.WARN,
                 confidence=0.6,
                 message=f"Persistent context from low-trust source: {boundary}",
+                evidence_kind="precaution",
                 risk_attribution=RiskAttribution(
                     risk_source="untrusted_source",
                     failure_mode="injection_via_persistence",
@@ -142,6 +143,7 @@ class ContextGuardRuleChecker(RuleChecker):
                 verdict=GuardVerdict.WARN,
                 confidence=0.5,
                 message="KB content should be treated with isolation",
+                evidence_kind="precaution",
                 transformed_args=self._add_isolation_banner(context),
             )
 

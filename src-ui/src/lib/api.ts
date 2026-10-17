@@ -33,6 +33,10 @@ export interface AgentInfo {
   name: string;
   installed: boolean;
   protected: boolean;
+  configured: boolean;
+  can_protect: boolean;
+  protection_status: "protected" | "needs_attention" | "not_protected";
+  coverage?: string[];
   experimental: boolean;
   cli_path: string;
   config_path: string;
@@ -65,9 +69,10 @@ export interface AppStatus {
     warnings: number;
   };
   last_event?: SecurityEvent | null;
+  services_running?: boolean;
+  protection_enabled?: boolean;
 
   /** Legacy Tauri in-memory status fields kept as a temporary fallback. */
-  protection_enabled?: boolean;
   proxy_port?: number;
   bridge_port?: number;
   blocked_count?: number;
@@ -117,6 +122,7 @@ export interface EventEvidence {
   verdict?: string;
   risk_source?: string;
   confidence?: number | null;
+  evidence_kind?: string;
 }
 
 export interface SecurityEvent {
@@ -140,6 +146,7 @@ interface LegacySecurityEvent {
   guard_name?: string;
   verdict?: string;
   message?: string;
+  evidence_kind?: string;
 }
 
 interface LegacyAgentInfo {
@@ -165,6 +172,10 @@ function booleanValue(value: unknown, fallback = false): boolean {
   return typeof value === "boolean" ? value : fallback;
 }
 
+function isNotice(verdict: string, evidenceKind: unknown): boolean {
+  return verdict.toLowerCase() === "warn" && (evidenceKind === "precaution" || evidenceKind === "degraded");
+}
+
 function normalizeEvidence(value: unknown): EventEvidence {
   const raw = asRecord(value);
   const confidence = raw.confidence;
@@ -177,6 +188,7 @@ function normalizeEvidence(value: unknown): EventEvidence {
     guard: stringValue(raw.guard),
     verdict: stringValue(raw.verdict),
     risk_source: stringValue(raw.risk_source),
+    evidence_kind: stringValue(raw.evidence_kind, "finding"),
   };
   if (confidence === null || typeof confidence === "number") {
     normalized.confidence = confidence;
@@ -188,12 +200,21 @@ export function normalizeAgentInfo(value: unknown): AgentInfo {
   const raw = asRecord(value) as LegacyAgentInfo & Partial<AgentInfo>;
   const key = stringValue(raw.key, stringValue(raw.agent_type, ""));
   const name = stringValue(raw.name, stringValue(raw.display_name, key || "Unknown"));
+  const configured = booleanValue(raw.configured, booleanValue(raw.taken_over, booleanValue(raw.protected)));
+  // A saved takeover record is recoverable configuration, not proof that the
+  // service is healthy or the agent still points at it.
+  const protectedNow = raw.protection_status === "protected" && raw.protected === true;
 
   return {
     key,
     name,
     installed: booleanValue(raw.installed),
-    protected: booleanValue(raw.protected, booleanValue(raw.taken_over)),
+    protected: protectedNow,
+    configured,
+    can_protect: booleanValue(raw.can_protect, key !== "workbuddy"),
+    protection_status: protectedNow ? "protected" : configured || raw.protection_status === "needs_attention"
+      ? "needs_attention" : "not_protected",
+    coverage: Array.isArray(raw.coverage) ? raw.coverage.filter((item): item is string => typeof item === "string") : [],
     experimental: booleanValue(raw.experimental),
     cli_path: stringValue(raw.cli_path),
     config_path: stringValue(raw.config_path),
@@ -211,6 +232,7 @@ export function normalizeSecurityEvent(value: unknown): SecurityEvent {
   const legacyGuard = stringValue(raw.guard_name, "proxy");
   const legacyVerdict = stringValue(raw.verdict, "pass");
   const legacyMessage = stringValue(raw.message);
+  const notice = isNotice(legacyVerdict, raw.evidence_kind);
 
   return {
     id: stringValue(raw.id, `evt_ui_${Date.now()}_${Math.random().toString(16).slice(2)}`),
@@ -229,18 +251,21 @@ export function normalizeSecurityEvent(value: unknown): SecurityEvent {
       resource: stringValue(action.resource, legacyMessage),
     },
     risk: {
-      category: stringValue(risk.category, legacyGuard),
-      severity: stringValue(risk.severity, legacyVerdict === "block" ? "high" : "medium"),
+      category: stringValue(risk.category, notice ? "Protection Notice" : legacyGuard),
+      severity: stringValue(risk.severity, notice ? "info" : legacyVerdict === "block" ? "high" : "medium"),
       confidence: numberValue(risk.confidence),
     },
     decision: {
-      verdict: stringValue(decision.verdict, legacyVerdict),
+      verdict: stringValue(decision.verdict, notice ? "info" : legacyVerdict),
       mode: stringValue(decision.mode, "enforce"),
       blocked_by: Array.isArray(decision.blocked_by)
         ? decision.blocked_by.map((item) => String(item))
         : [],
     },
-    evidence: evidence.map(normalizeEvidence),
+    evidence: evidence.length ? evidence.map(normalizeEvidence) : notice ? [normalizeEvidence({
+      type: "guard_result", guard: legacyGuard, verdict: legacyVerdict,
+      message: legacyMessage, evidence_kind: raw.evidence_kind,
+    })] : [],
     recommendation: stringValue(raw.recommendation, legacyMessage),
     correlation_id: stringValue(raw.correlation_id),
     raw_ref: stringValue(raw.raw_ref),
@@ -263,8 +288,29 @@ export function normalizeStatus(value: unknown): AppStatus {
 
 export function statusProtectionEnabled(status: AppStatus | null): boolean {
   if (!status) return false;
-  if (typeof status.protection_enabled === "boolean") return status.protection_enabled;
-  return Object.keys(status.protected_agents ?? {}).length > 0;
+  if (status.protection_enabled === false) return false;
+  if (status.detected_agents?.some((agent) => agent.protected && agent.protection_status === "protected")) return true;
+  // This product verdict means a verified agent route, not just a running service.
+  return status.protection_enabled === true;
+}
+
+export function statusHasConfiguredAgents(status: AppStatus | null): boolean {
+  return Boolean(status && (
+    status.detected_agents?.some((agent) => agent.configured)
+    || Object.keys(status.protected_agents ?? {}).length > 0
+  ));
+}
+
+export function agentAction(agent: AgentInfo): "restore" | "protect" | "manual" | "unavailable" {
+  if (agent.configured) return "restore";
+  if (!agent.installed) return "unavailable";
+  return agent.can_protect ? "protect" : "manual";
+}
+
+export function agentStatus(agent: AgentInfo): "protected" | "needs_attention" | "available" | "missing" {
+  if (agent.protected && agent.protection_status === "protected") return "protected";
+  if (agent.configured || agent.protection_status === "needs_attention") return "needs_attention";
+  return agent.installed ? "available" : "missing";
 }
 
 export function statusEventCounts(status: AppStatus | null): { blocked: number; warnings: number } {
@@ -303,33 +349,38 @@ export function makeRealtimeEvent(payload: Record<string, unknown>): SecurityEve
   const blockReason = stringValue(payload.block_reason);
 
   if (guardResults.length > 0) {
-    return guardResults.map((result) => normalizeSecurityEvent({
-      timestamp: new Date().toISOString(),
-      source: "desktop",
-      stage: "runtime",
-      action: {
-        type: "guard_event",
-        name: stringValue(result.guard, "proxy"),
-        resource: stringValue(result.message),
-      },
-      risk: {
-        category: stringValue(result.guard, "Guard"),
-        severity: stringValue(result.verdict) === "block" ? "high" : "medium",
-        confidence: numberValue(result.confidence),
-      },
-      decision: {
-        verdict: stringValue(result.verdict, action),
-        mode: "enforce",
-        blocked_by: stringValue(result.verdict) === "block" ? [stringValue(result.guard)] : [],
-      },
-      evidence: [{
-        type: "guard_result",
-        guard: stringValue(result.guard),
-        verdict: stringValue(result.verdict),
-        message: stringValue(result.message),
-      }],
-      recommendation: stringValue(result.message),
-    }));
+    return guardResults.map((result) => {
+      const rawVerdict = stringValue(result.verdict, action);
+      const notice = isNotice(rawVerdict, result.evidence_kind);
+      return normalizeSecurityEvent({
+        timestamp: new Date().toISOString(),
+        source: "desktop",
+        stage: "runtime",
+        action: {
+          type: "guard_event",
+          name: stringValue(result.guard, "proxy"),
+          resource: stringValue(result.message),
+        },
+        risk: {
+          category: notice ? "Protection Notice" : stringValue(result.guard, "Guard"),
+          severity: notice ? "info" : rawVerdict === "block" ? "high" : "medium",
+          confidence: numberValue(result.confidence),
+        },
+        decision: {
+          verdict: notice ? "info" : rawVerdict,
+          mode: "enforce",
+          blocked_by: stringValue(result.verdict) === "block" ? [stringValue(result.guard)] : [],
+        },
+        evidence: [{
+          type: "guard_result",
+          guard: stringValue(result.guard),
+          verdict: stringValue(result.verdict),
+          message: stringValue(result.message),
+          evidence_kind: stringValue(result.evidence_kind, "finding"),
+        }],
+        recommendation: stringValue(result.message),
+      });
+    });
   }
 
   if (action === "block" || action === "warn") {

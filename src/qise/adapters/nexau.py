@@ -10,7 +10,7 @@ Uses NexAU's Middleware class for non-invasive integration:
 
 BLOCK strategy:
 - after_model: Remove dangerous tool calls from parsed_response.tool_calls list
-- before_tool: Clear tool_input to {"__qise_blocked": True}
+- before_tool: Raise RuntimeError before tool execution
 
 Usage:
     from qise import Shield
@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin
+from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin, blocked_message
 from qise.core.shield import Shield
 
 logger = logging.getLogger("qise.adapters.nexau")
@@ -84,6 +84,7 @@ class QiseNexauMiddleware(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
         )
         if result.should_block:
             logger.warning("NexAU: agent startup blocked — %s", result.blocked_by)
+            raise RuntimeError(blocked_message(result))
 
     async def after_agent(self, context: Any) -> None:
         """Hook: Check agent output for credential/PII leaks.
@@ -103,6 +104,10 @@ class QiseNexauMiddleware(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
         )
         if result.should_block:
             logger.warning("NexAU: agent output blocked — %s", result.blocked_by)
+            for key in ("output", "result"):
+                if hasattr(context, key):
+                    setattr(context, key, blocked_message(result))
+            raise RuntimeError(blocked_message(result))
 
     async def before_model(self, context: Any) -> None:
         """Hook: Inject SecurityContext into messages before model call.
@@ -230,7 +235,7 @@ class QiseNexauMiddleware(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
     async def before_tool(self, context: Any) -> None:
         """Hook: Secondary egress check before tool execution.
 
-        If blocked, clears tool_input to prevent execution.
+        If blocked, raises before execution rather than calling with empty input.
         """
         if not self._installed:
             return
@@ -257,11 +262,7 @@ class QiseNexauMiddleware(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
                 tool_name,
                 result.blocked_by,
             )
-            # Clear tool input to prevent execution
-            if hasattr(context, "tool_input"):
-                context.tool_input = {"__qise_blocked": True}
-            elif hasattr(context, "arguments"):
-                context.arguments = {"__qise_blocked": True}
+            raise RuntimeError(blocked_message(result))
 
     async def after_tool(self, context: Any) -> None:
         """Hook: Check tool result for injection.
@@ -289,3 +290,12 @@ class QiseNexauMiddleware(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
                 tool_name,
                 result.blocked_by,
             )
+            for key in ("tool_result", "result"):
+                if hasattr(context, key):
+                    setattr(context, key, blocked_message(result))
+            raise RuntimeError(blocked_message(result))
+        if isinstance(tool_result, str) and result.transformed_args is not None:
+            content = result.transformed_args.get("content")
+            if isinstance(content, str):
+                key = "tool_result" if hasattr(context, "tool_result") else "result"
+                setattr(context, key, content)

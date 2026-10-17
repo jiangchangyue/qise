@@ -1,9 +1,10 @@
+import { useState } from "react";
 import type { GuardInfo } from "../lib/api";
 import { modeLabel, pipelineLabel, tr, type Locale } from "../lib/locale";
 
 interface GuardListProps {
   guards: GuardInfo[];
-  onSetMode: (guardName: string, mode: string) => void;
+  onSetMode: (guardName: string, mode: string) => Promise<void>;
   locale: Locale;
 }
 
@@ -49,10 +50,25 @@ const PIPELINE_ICON_CLASSES: Record<string, string> = {
 };
 
 export default function GuardList({ guards, onSetMode, locale }: GuardListProps) {
+  const [busyGuard, setBusyGuard] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  async function changeMode(guardName: string, mode: string) {
+    setBusyGuard(guardName);
+    setError(null);
+    try {
+      await onSetMode(guardName, mode);
+    } catch (failure) {
+      setError(String(failure));
+    } finally {
+      setBusyGuard(null);
+    }
+  }
   // Group by pipeline
   const grouped = guards.reduce(
     (acc, g) => {
-      const key = g.pipeline;
+      // A shared guard has one policy, even when it checks several stages.
+      const key = g.pipeline.split("/")[0];
       if (!acc[key]) acc[key] = [];
       acc[key].push(g);
       return acc;
@@ -62,6 +78,7 @@ export default function GuardList({ guards, onSetMode, locale }: GuardListProps)
 
   return (
     <div className="space-y-6">
+      {error && <p role="alert" className="text-sm text-qise-red">{error}</p>}
       {["ingress", "egress", "output"].map((pipeline) => {
         const pipelineGuards = grouped[pipeline];
         if (!pipelineGuards) return null;
@@ -99,7 +116,8 @@ export default function GuardList({ guards, onSetMode, locale }: GuardListProps)
                       <button
                         key={mode}
                         className={guardModeBtnClass(mode, guard.mode === mode)}
-                        onClick={() => onSetMode(guard.name, mode)}
+                        disabled={busyGuard !== null}
+                        onClick={() => void changeMode(guard.name, mode)}
                       >
                         {modeLabel(locale, mode)}
                       </button>

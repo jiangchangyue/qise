@@ -20,8 +20,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import signal
 import sys
+import threading
 from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -32,7 +35,52 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from qise import Shield
+from qise.core.config import ShieldConfig
 from qise.core.models import GuardContext, GuardVerdict
+from qise.models.router import ModelConfig
+
+EVAL_MODES = ("rules-only", "slm", "full")
+
+
+def config_for_mode(config: ShieldConfig, mode: str) -> ShieldConfig:
+    """Copy configuration and select the model layers used by this experiment.
+
+    Rule fast paths and configured observe/enforce/off modes remain active in
+    every experiment. Model modes require configuration, not network access at
+    construction time; actual model availability is still a runtime concern.
+    """
+    if mode not in EVAL_MODES:
+        raise ValueError(f"Unknown evaluation mode: {mode}")
+    selected = config.model_copy(deep=True)
+    required = () if mode == "rules-only" else ("slm", "llm") if mode == "full" else ("slm",)
+    for name in required:
+        model = getattr(selected.models, name)
+        if not model.base_url.strip() or not model.model.strip():
+            raise ValueError(f"Evaluation mode '{mode}' requires a configured {name.upper()} endpoint and model")
+    for name in ("slm", "llm", "embedding"):
+        if name not in required:
+            setattr(selected.models, name, ModelConfig(base_url="", model="", api_key=None))
+    return selected
+
+
+@contextmanager
+def sample_timeout(seconds: int = 120):
+    """Bound checks on POSIX; Windows/worker threads use model HTTP timeouts."""
+    supported = hasattr(signal, "SIGALRM") and threading.current_thread() is threading.main_thread()
+    if not supported:
+        yield
+        return
+
+    def on_timeout(signum, frame):
+        raise TimeoutError(f"Sample exceeded {seconds}s")
+
+    previous = signal.signal(signal.SIGALRM, on_timeout)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous)
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +111,7 @@ class EvalResult:
     correct: bool
     guard_verdicts: dict[str, str] = field(default_factory=dict)
     blocked_by: str | None = None
+    error: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -72,65 +121,68 @@ class EvalResult:
 class QiseEvaluator:
     """Run Qise guards against benchmark attack samples."""
 
-    def __init__(self, shield: Shield, mode: str = "rules-only"):
-        self.shield = shield
+    def __init__(self, shield: Shield | ShieldConfig, mode: str = "rules-only"):
+        # Accept the former Shield argument, but never reuse its mutable guards,
+        # model circuit breakers, session history, or metrics between runs.
+        config = shield.config if isinstance(shield, Shield) else shield
+        self.base_config = config.model_copy(deep=True)
+        self.config = config_for_mode(self.base_config, mode)
+        self.shield = Shield(config=self.config.model_copy(deep=True))
         self.mode = mode
 
     def evaluate_dataset(self, samples: list[EvalSample]) -> EvalReport:
         """Run all samples, compute precision/recall/F1/FPR."""
-        import signal
+        self.shield = Shield(config=self.config.model_copy(deep=True))
         results: list[EvalResult] = []
         for i, sample in enumerate(samples):
-            # Per-sample timeout (120s) to prevent SLM hangs
-            def _timeout_handler(signum, frame):
-                raise TimeoutError(f"Sample {sample.id} timed out")
-            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
-            signal.alarm(120)
             try:
-                result = self._run_sample(sample)
+                with sample_timeout():
+                    result = self._run_sample(sample)
                 results.append(result)
             except TimeoutError as exc:
                 print(f"  TIMEOUT: {sample.id}", flush=True)
                 results.append(EvalResult(
                     sample_id=sample.id, source=sample.source,
                     category=sample.category, expected=sample.expected_verdict,
-                    actual="pass", correct=False,
-                    guard_verdicts={}, blocked_by="timeout",
+                    actual="error", correct=False,
+                    guard_verdicts={}, error=str(exc),
                 ))
             except Exception as exc:
                 print(f"  ERROR: {sample.id}: {exc}", flush=True)
                 results.append(EvalResult(
                     sample_id=sample.id, source=sample.source,
                     category=sample.category, expected=sample.expected_verdict,
-                    actual="pass", correct=False,
-                    guard_verdicts={}, blocked_by=f"error:{exc}",
+                    actual="error", correct=False,
+                    guard_verdicts={}, error=str(exc),
                 ))
-            finally:
-                signal.alarm(0)
-                signal.signal(signal.SIGALRM, old_handler)
             if (i + 1) % 5 == 0 or (i + 1) == len(samples):
                 print(f"  Progress: {i + 1}/{len(samples)}", flush=True)
         return EvalReport(results=results, mode=self.mode)
 
     def compare_modes(self, samples: list[EvalSample]) -> ComparisonReport:
         """Compare rules-only vs SLM vs full mode."""
+        # Validate all requested modes before starting a potentially long run.
+        evaluators = {mode: QiseEvaluator(self.base_config, mode) for mode in EVAL_MODES}
         reports: dict[str, EvalReport] = {}
-        for mode in ("rules-only", "slm", "full"):
-            evaluator = QiseEvaluator(self.shield, mode=mode)
+        for mode, evaluator in evaluators.items():
             reports[mode] = evaluator.evaluate_dataset(samples)
         return ComparisonReport(reports=reports, samples_count=len(samples))
 
     def _run_sample(self, sample: EvalSample) -> EvalResult:
         """Run a single sample through the shield pipeline."""
-        ctx = sample.guard_context
+        ctx = sample.guard_context.model_copy(deep=True)
+        guard_modes = {
+            name: self.shield.config.guard_mode(name)
+            for name in self.shield.config.guards.enabled
+        }
 
         # Determine pipeline
         if ctx.trust_boundary is not None:
-            result = self.shield.pipeline.run_ingress(ctx)
+            result = self.shield.pipeline.run_ingress(ctx, guard_modes)
         elif ctx.tool_name in ("output_check", "content_check") and ctx.trust_boundary is None:
-            result = self.shield.pipeline.run_output(ctx)
+            result = self.shield.pipeline.run_output(ctx, guard_modes)
         else:
-            result = self.shield.pipeline.run_egress(ctx)
+            result = self.shield.pipeline.run_egress(ctx, guard_modes)
 
         actual = _classify_result(result.verdict, result.should_block)
         guard_verdicts = {
@@ -168,6 +220,11 @@ class EvalReport:
         return compute_metrics(self.results)
 
     @property
+    def detection(self) -> dict:
+        """Risk detection counts WARN as positive, regardless of enforcement."""
+        return compute_metrics(self.results, strict=False)
+
+    @property
     def by_source(self) -> dict[str, dict]:
         by_src: dict[str, list[EvalResult]] = defaultdict(list)
         for r in self.results:
@@ -183,18 +240,19 @@ class EvalReport:
 
     @property
     def by_guard(self) -> dict[str, dict]:
-        """Per-guard metrics: for each guard, was it the one that caught/missed the attack?"""
+        """Diagnostics for samples each guard actually saw, using its own verdict.
+
+        Short-circuited guards are absent, so these are not comparable standalone
+        guard benchmark scores.
+        """
         guard_results: dict[str, list[EvalResult]] = defaultdict(list)
         for r in self.results:
-            # A guard "caught" an attack if it returned warn/block and the attack was detected
             for gname, gverdict in r.guard_verdicts.items():
-                if gverdict != "pass":
-                    guard_results[gname].append(r)
-                    break  # Only credit the first guard that flagged
-            else:
-                # No guard flagged — all missed
-                for gname in r.guard_verdicts:
-                    guard_results[gname].append(r)
+                guard_results[gname].append(EvalResult(
+                    sample_id=r.sample_id, source=r.source, category=r.category,
+                    expected=r.expected, actual=gverdict,
+                    correct=_matches(r.expected, gverdict),
+                ))
 
         # For guards that saw samples, compute metrics
         return {k: compute_metrics(v) for k, v in guard_results.items()}
@@ -217,9 +275,9 @@ class ComparisonReport:
 
 def _classify_result(verdict: str, should_block: bool) -> str:
     """Map GuardVerdict to eval classification."""
-    if should_block or verdict == GuardVerdict.BLOCK:
+    if should_block:
         return "block"
-    if verdict == GuardVerdict.WARN:
+    if verdict in (GuardVerdict.WARN, GuardVerdict.BLOCK, GuardVerdict.APPROVE, GuardVerdict.ESCALATE):
         return "warn"
     return "pass"
 
@@ -243,13 +301,20 @@ def _matches(expected: str, actual: str) -> bool:
 # Metrics computation
 # ---------------------------------------------------------------------------
 
-def compute_metrics(results: list[EvalResult]) -> dict:
-    """Compute precision, recall, F1, FPR from evaluation results."""
+def compute_metrics(results: list[EvalResult], *, strict: bool = True) -> dict:
+    """Measure required actions by default; optionally measure risk detection.
+
+    Execution errors never become safe true negatives. They are reported
+    separately and count against expectation accuracy and block recall.
+    """
     tp = fp = fn = tn = 0
 
     for r in results:
+        if r.error is not None or r.actual == "error":
+            continue
         if r.expected != "pass":
-            if r.actual != "pass":
+            detected = _matches(r.expected, r.actual) if strict else r.actual in ("warn", "block")
+            if detected:
                 tp += 1
             else:
                 fn += 1
@@ -263,6 +328,9 @@ def compute_metrics(results: list[EvalResult]) -> dict:
     recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
     fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+    required_blocks = sum(r.expected == "block" for r in results)
+    completed_blocks = sum(r.expected == "block" and r.actual == "block" and not r.error for r in results)
+    correct = sum(_matches(r.expected, r.actual) and not r.error for r in results)
 
     return {
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
@@ -271,6 +339,11 @@ def compute_metrics(results: list[EvalResult]) -> dict:
         "total": len(results),
         "attacks": sum(1 for r in results if r.expected != "pass"),
         "safe": sum(1 for r in results if r.expected == "pass"),
+        "errors": sum(r.error is not None or r.actual == "error" for r in results),
+        "accuracy": correct / len(results) if results else 0.0,
+        "required_blocks": required_blocks,
+        "completed_blocks": completed_blocks,
+        "block_recall": completed_blocks / required_blocks if required_blocks else None,
     }
 
 
@@ -334,6 +407,7 @@ def load_benchmark(source: str, limit: int | None = None, cache_dir: str | None 
 def format_report(report: EvalReport, title: str = "Qise Guard Evaluation") -> str:
     """Format an EvalReport as Markdown."""
     overall = report.overall
+    detection = report.detection
     by_source = report.by_source
     by_category = report.by_category
     by_guard = report.by_guard
@@ -341,30 +415,46 @@ def format_report(report: EvalReport, title: str = "Qise Guard Evaluation") -> s
 
     lines = [
         f"# {title}",
-        f"",
+        "",
         f"**Mode**: {report.mode}",
         f"**Date**: {date.today().isoformat()}",
         f"**Total cases**: {overall['total']} ({overall['attacks']} attacks, {overall['safe']} safe)",
-        f"",
-        f"## Overall Metrics",
-        f"",
-        f"| Metric | Value |",
-        f"|--------|-------|",
+        "",
+        "## Strict Action Metrics",
+        "",
+        "Expected BLOCK requires actual blocking; WARN is not a successful block.",
+        "Execution errors are excluded from confusion matrices and count against expectation accuracy.",
+        "Model modes select allowed layers; rule fast paths and runtime fallback remain active.",
+        "",
+        "| Metric | Value |",
+        "|--------|-------|",
         f"| Precision | {overall['precision']:.3f} |",
         f"| Recall | {overall['recall']:.3f} |",
         f"| F1 | {overall['f1']:.3f} |",
         f"| False Positive Rate | {overall['fpr']:.3f} |",
         f"| TP / FP / FN / TN | {overall['tp']} / {overall['fp']} / {overall['fn']} / {overall['tn']} |",
+        f"| Expectation accuracy (including errors) | {overall['accuracy']:.3f} |",
+        f"| Execution errors | {overall['errors']} |",
+        f"| Required blocks completed | {overall['completed_blocks']} / {overall['required_blocks']} |",
+        f"| Block recall | {_format_ratio(overall['block_recall'])} |",
+        "",
+        "## Risk Detection Metrics",
+        "",
+        "WARN and BLOCK both count as detected risk in this separate table.",
+        "",
+        "| Precision | Recall | F1 | False Positive Rate |",
+        "|-----------|--------|----|---------------------|",
+        f"| {detection['precision']:.3f} | {detection['recall']:.3f} | {detection['f1']:.3f} | {detection['fpr']:.3f} |",
     ]
 
     # Per-source (dataset) metrics
     if by_source:
         lines.extend([
-            f"",
-            f"## Per-Source Metrics",
-            f"",
-            f"| Source | Attacks | Safe | Precision | Recall | F1 | FPR |",
-            f"|--------|---------|------|-----------|--------|----|-----|",
+            "",
+            "## Per-Source Metrics",
+            "",
+            "| Source | Attacks | Safe | Precision | Recall | F1 | FPR |",
+            "|--------|---------|------|-----------|--------|----|-----|",
         ])
         for name, m in by_source.items():
             lines.append(
@@ -375,11 +465,13 @@ def format_report(report: EvalReport, title: str = "Qise Guard Evaluation") -> s
     # Per-guard metrics
     if by_guard:
         lines.extend([
-            f"",
-            f"## Per-Guard Results",
-            f"",
-            f"| Guard | TP | FP | FN | TN | Precision | Recall | F1 |",
-            f"|-------|----|----|----|-----|-----------|--------|-----|",
+            "",
+            "## Per-Guard Results",
+            "",
+            "Strict diagnostics on samples each guard actually saw; short-circuited guards are not evaluated.",
+            "",
+            "| Guard | TP | FP | FN | TN | Precision | Recall | F1 |",
+            "|-------|----|----|----|-----|-----------|--------|-----|",
         ])
         for guard, m in sorted(by_guard.items()):
             lines.append(
@@ -390,11 +482,11 @@ def format_report(report: EvalReport, title: str = "Qise Guard Evaluation") -> s
     # Per-category metrics
     if by_category:
         lines.extend([
-            f"",
-            f"## Per-Category Metrics",
-            f"",
-            f"| Category | Total | Precision | Recall | F1 | FPR |",
-            f"|----------|-------|-----------|--------|----|-----|",
+            "",
+            "## Per-Category Metrics",
+            "",
+            "| Category | Total | Precision | Recall | F1 | FPR |",
+            "|----------|-------|-----------|--------|----|-----|",
         ])
         for cat, m in sorted(by_category.items()):
             lines.append(
@@ -405,35 +497,43 @@ def format_report(report: EvalReport, title: str = "Qise Guard Evaluation") -> s
     # Mismatches
     if errors:
         lines.extend([
-            f"",
+            "",
             f"## Mismatches ({len(errors)})",
-            f"",
-            f"| Sample ID | Source | Category | Expected | Actual | Blocked By |",
-            f"|-----------|--------|----------|----------|--------|------------|",
+            "",
+            "| Sample ID | Source | Category | Expected | Actual | Blocked By / Error |",
+            "|-----------|--------|----------|----------|--------|--------------------|",
         ])
         for e in errors[:100]:  # Cap at 100
-            lines.append(f"| {e.sample_id} | {e.source} | {e.category} | {e.expected} | {e.actual} | {e.blocked_by or '-'} |")
+            detail = (e.error or e.blocked_by or "-").replace("|", "\\|").replace("\n", " ")
+            lines.append(f"| {e.sample_id} | {e.source} | {e.category} | {e.expected} | {e.actual} | {detail} |")
         if len(errors) > 100:
             lines.append(f"| ... | ... | ... | ... | ... | ... | ({len(errors) - 100} more)")
 
     return "\n".join(lines)
 
 
+def _format_ratio(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.3f}"
+
+
 def format_comparison(comparison: ComparisonReport) -> str:
     """Format a ComparisonReport as Markdown."""
     lines = [
-        f"# Qise Mode Comparison",
-        f"",
+        "# Qise Mode Comparison",
+        "",
         f"**Samples**: {comparison.samples_count}",
-        f"",
-        f"| Mode | Precision | Recall | F1 | FPR | TP | FP | FN | TN |",
-        f"|------|-----------|--------|----|-----|----|----|----|----|",
+        "",
+        "Strict action metrics; expected BLOCK requires actual blocking.",
+        "",
+        "| Mode | Precision | Recall | F1 | FPR | Block recall | Errors | Detection F1 |",
+        "|------|-----------|--------|----|-----|--------------|--------|--------------|",
     ]
     for mode, report in comparison.reports.items():
         m = report.overall
         lines.append(
             f"| {mode} | {m['precision']:.3f} | {m['recall']:.3f} | "
-            f"{m['f1']:.3f} | {m['fpr']:.3f} | {m['tp']} | {m['fp']} | {m['fn']} | {m['tn']} |"
+            f"{m['f1']:.3f} | {m['fpr']:.3f} | {_format_ratio(m['block_recall'])} | "
+            f"{m['errors']} | {report.detection['f1']:.3f} |"
         )
 
     # Delta: slm vs rules-only, full vs rules-only
@@ -467,7 +567,8 @@ def main() -> None:
                               help="Third-party benchmark source")
     source_group.add_argument("--dataset", help="Path to local YAML dataset directory")
     parser.add_argument("--config", default=None, help="Path to shield.yaml")
-    parser.add_argument("--mode", default="rules-only", help="Evaluation mode: rules-only, slm, full")
+    parser.add_argument("--mode", choices=EVAL_MODES, default="rules-only",
+                        help="Allowed model layers: none, SLM, or SLM + LLM (rules remain enabled)")
     parser.add_argument("--output", default=None, help="Output file path (default: stdout)")
     parser.add_argument("--limit", type=int, default=None, help="Max samples to evaluate")
     parser.add_argument("--compare", action="store_true", help="Compare rules-only vs slm vs full")
@@ -486,6 +587,8 @@ def main() -> None:
             cases = load_yaml_dataset(yaml_file)
             samples.extend(cases)
             print(f"Loaded {len(cases)} cases from {yaml_file.name}")
+        if args.limit is not None:
+            samples = samples[:args.limit]
     else:
         print(f"Loading {args.source} dataset...")
         samples = load_benchmark(args.source, limit=args.limit, cache_dir=args.cache_dir)
@@ -496,10 +599,19 @@ def main() -> None:
         sys.exit(1)
 
     # Create shield
-    shield = Shield.from_config(args.config)
+    config_path = Path(args.config) if args.config else Path("shield.yaml")
+    if args.config and not config_path.is_file():
+        parser.error(f"Config file not found: {config_path}")
+    config = ShieldConfig.from_yaml(config_path)
 
     # Run evaluation
-    evaluator = QiseEvaluator(shield, mode=args.mode)
+    try:
+        evaluator = QiseEvaluator(config, mode=args.mode)
+        if args.compare:
+            for mode in EVAL_MODES:
+                config_for_mode(config, mode)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     if args.compare:
         print("\nRunning mode comparison...")

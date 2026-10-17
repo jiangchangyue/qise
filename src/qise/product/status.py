@@ -10,11 +10,11 @@ from qise.core.config import ShieldConfig
 from qise.product.agents import detect_agents
 from qise.product.events import count_recent_events, load_events
 from qise.product.service import (
-    DEFAULT_BRIDGE_PORT,
     check_port,
     events_path,
     inspect_services,
     load_state,
+    qise_home,
     services_are_active,
     state_path,
 )
@@ -24,9 +24,9 @@ from qise.product.slm import slm_status
 def load_config(config_path: str | None = None) -> tuple[ShieldConfig, str]:
     if config_path:
         return ShieldConfig.from_yaml(config_path), str(Path(config_path))
-    default = Path("shield.yaml")
-    if default.exists():
-        return ShieldConfig.from_yaml(default), str(default)
+    for default in (qise_home() / "shield.yaml", Path("shield.yaml")):
+        if default.exists():
+            return ShieldConfig.from_yaml(default), str(default)
     return ShieldConfig.default(), "(defaults)"
 
 
@@ -35,9 +35,11 @@ def get_status(config_path: str | None = None) -> dict[str, Any]:
     state = load_state()
     services = inspect_services(state)
     proxy_port = config.integration.proxy.port
-    bridge_port = int(services.get("bridge", {}).get("port", DEFAULT_BRIDGE_PORT))
+    bridge_port = config.integration.bridge_port
     blocks, warnings = count_recent_events()
     events = load_events(limit=1)
+    services_running = services_are_active(services)
+    agents = detect_agents(services_active=services_running)
 
     return {
         "config": config_label,
@@ -48,8 +50,9 @@ def get_status(config_path: str | None = None) -> dict[str, Any]:
         "bridge": check_port("127.0.0.1", bridge_port).__dict__,
         "slm": slm_status(config_path=config_path),
         "protected_agents": state.get("protected_agents", {}),
-        "protection_enabled": services_are_active(services),
-        "detected_agents": detect_agents(),
+        "services_running": services_running,
+        "protection_enabled": any(agent["protected"] for agent in agents),
+        "detected_agents": agents,
         "events_24h": {
             "blocked": blocks,
             "warnings": warnings,
@@ -73,7 +76,7 @@ def render_status(status: dict[str, Any], *, json_output: bool = False) -> str:
         proxy_state = "listening"
     if status["bridge"]["status"] == "in_use" and bridge_state == "in_use":
         bridge_state = "listening"
-    qise_running = bool(status.get("protection_enabled"))
+    qise_running = bool(status.get("services_running", status.get("protection_enabled")))
     slm = status.get("slm", {})
     slm_ready = slm.get("verification") == "ready"
     lines = [
@@ -96,7 +99,8 @@ def render_status(status: dict[str, Any], *, json_output: bool = False) -> str:
         f"  Ready: {'yes' if slm_ready else 'no'} ({slm.get('verification', 'unknown')})",
         "",
         "Protection",
-        f"  Protected agents: {', '.join(sorted(protected)) if protected else 'none'}",
+        f"  Protected agents: {', '.join(agent['name'] for agent in status['detected_agents'] if agent['protected']) or 'none'}",
+        f"  Configured agents: {', '.join(sorted(protected)) if protected else 'none'}",
     ]
     for name, record in sorted(protected.items()):
         if isinstance(record, dict):
@@ -107,7 +111,7 @@ def render_status(status: dict[str, Any], *, json_output: bool = False) -> str:
     if status["detected_agents"]:
         for agent in status["detected_agents"]:
             install = "installed" if agent["installed"] else "not found"
-            protected_text = "protected" if agent["protected"] else "not protected"
+            protected_text = "protected" if agent["protected"] else "configured, needs attention" if agent.get("configured") else "not protected"
             suffix = " (experimental)" if agent["experimental"] else ""
             lines.append(f"  {agent['name']}: {install}, {protected_text}{suffix}")
     else:

@@ -11,7 +11,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import yaml
 
@@ -63,8 +63,8 @@ class BaselineManager:
 
     def __init__(self, baselines_dir: Path | str | None = None, db: BaselineDB | None = None) -> None:
         self._baselines_dir = Path(baselines_dir) if baselines_dir else None
-        if self._baselines_dir:
-            self._baselines_dir.mkdir(parents=True, exist_ok=True)
+        # Reads tolerate a missing directory; _save creates it on the first write.
+        # Initializing a Shield should not mutate (possibly bundled) data paths.
         self._db = db  # Optional SQLite persistence; None → YAML-only
 
     @staticmethod

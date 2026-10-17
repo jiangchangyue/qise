@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { AgentInfo } from "../lib/api";
+import { agentAction, agentStatus, type AgentInfo } from "../lib/api";
 import { agentStatusLabel, tr, type Locale } from "../lib/locale";
 
 interface AgentTaskState {
@@ -18,14 +18,8 @@ interface AgentPanelProps {
 
 function statusColor(agent: AgentInfo): string {
   if (agent.protected) return "var(--qise-green)";
-  if (agent.installed) return "var(--qise-yellow)";
+  if (agent.installed || agent.configured) return "var(--qise-yellow)";
   return "var(--indicator-muted)";
-}
-
-function statusKey(agent: AgentInfo): "protected" | "available" | "missing" {
-  if (agent.protected) return "protected";
-  if (agent.installed) return "available";
-  return "missing";
 }
 
 function backupPreview(agent: AgentInfo): string {
@@ -83,6 +77,20 @@ export default function AgentPanel({ agents, task, onProtect, onRestore, locale 
               <p className="text-xs text-[var(--text-dim)] truncate">
                 {agent.config_path || agent.cli_path || agent.note || tr(locale, "No local config detected", "未检测到本地配置")}
               </p>
+              {agent.protection_status === "needs_attention" && (
+                <p className="mt-1 text-xs text-qise-yellow">
+                  {tr(locale, "Protection is not active. Restore the original settings before reconnecting.", "保护当前未生效。可先恢复原设置，再重新开启保护。")}
+                </p>
+              )}
+              {agent.coverage?.map((detail) => (
+                <p key={detail} className="mt-1 text-xs text-[var(--text-dim)]">{
+                  detail === "preflight" ? tr(locale, "Preflight safety checks", "支持运行前安全体检")
+                    : detail === "model_traffic" ? tr(locale, "Checks connected model traffic", "检查接入后的模型通信")
+                      : detail === "manual_connection" ? tr(locale, "Connect in your model settings", "需在模型设置中手动接入")
+                        : detail === "runtime_observation" ? tr(locale, "Runtime observation requires a separate start", "运行观察需单独启动")
+                          : detail
+                }</p>
+              ))}
             </div>
             <span
               className="text-xs px-2 py-0.5 rounded-full shrink-0"
@@ -91,12 +99,12 @@ export default function AgentPanel({ agents, task, onProtect, onRestore, locale 
                 backgroundColor: `${statusColor(agent)}20`,
               }}
             >
-              {agentStatusLabel(locale, statusKey(agent))}
+              {agentStatusLabel(locale, agentStatus(agent))}
             </span>
           </div>
 
-          {agent.installed && (
-            agent.protected ? (
+          {agentAction(agent) !== "unavailable" && (
+            agentAction(agent) === "restore" ? (
               <button
                 className="text-xs px-3 py-1.5 rounded-[86px] bg-[var(--button-primary-bg)] text-[var(--button-primary-text)] hover:opacity-60 transition-opacity disabled:opacity-40"
                 disabled={anyBusy}
@@ -106,6 +114,10 @@ export default function AgentPanel({ agents, task, onProtect, onRestore, locale 
                   <span className="inline-flex items-center gap-2"><span className="qise-spinner" />{tr(locale, "Restoring...", "正在恢复...")}</span>
                 ) : tr(locale, "Restore", "恢复")}
               </button>
+            ) : agentAction(agent) === "manual" ? (
+              <p className="max-w-48 text-xs text-[var(--text-tertiary)]">
+                {tr(locale, "Manual connection required. Use the custom connection settings below; automatic protection is unavailable.", "需手动接入：请使用下方自定义接入设置，暂不支持自动保护。")}
+              </p>
             ) : (
               <button
                 className="text-xs px-3 py-1.5 rounded-[86px] bg-transparent border border-[var(--border-strong)] text-[var(--text-primary)] hover:opacity-60 transition-opacity disabled:opacity-40"

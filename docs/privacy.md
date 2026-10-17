@@ -8,6 +8,7 @@ Default local state:
 
 ```text
 ~/.qise/state.json
+~/.qise/guard-policy.json
 ~/.qise/events.jsonl
 ~/.qise/backups/
 ~/.qise/logs/
@@ -33,13 +34,13 @@ Events should not become a copy of full model traffic. Proxy and bridge event wr
 
 ## Local SLM Data Flow
 
-`qise slm start` configures Qise to use a local Ollama endpoint by default (`http://localhost:11434/v1`) and the `qwen3:4b` model. In that default mode, semantic review prompts are sent to the local model server on your machine, not to a Qise cloud service.
+No SLM is configured or started by default. Explicitly running `qise slm start` selects a local Ollama endpoint (`http://localhost:11434/v1`) and the `qwen3:4b` model, and may install Ollama or download the model. In that mode, semantic review prompts are sent to the local model server on your machine, not to a Qise cloud service. The normal agent traffic still goes to the model provider you selected.
 
 Advanced users may point Qise at a custom OpenAI-compatible endpoint with `qise slm start --base-url ... --model ...`. In that case, reviewed snippets are sent to the endpoint you configured, so treat that endpoint as part of your trust boundary.
 
 ## Backups
 
-`qise protect` stores full Agent config backups so restore can work. Treat `~/.qise/backups/` as sensitive if your Agent config contains provider names, endpoint URLs, or environment variable names.
+`qise protect` stores full agent config backups so restore can work. Backups can contain inline API keys or other secrets from the original config. Treat `~/.qise/backups/` as sensitive and keep it until recovery is complete. Managed service command metadata does not embed upstream keys.
 
 ## Removing Local Data
 

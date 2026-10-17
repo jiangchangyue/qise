@@ -6,7 +6,7 @@
 
 **给 AI Agent 使用的本地优先安全层。**
 
-Qise 可以帮助你在使用 Codex、OpenClaw、Claude Code 以及自定义 Agent 时，增加一层本地安全防护：扫描高风险集成、把模型流量接入本地 Guard Proxy、拦截危险动作，并留下可读的本地安全事件记录。
+Qise 可以帮助你在使用 Codex、OpenClaw、Claude Code、OpenCode 以及自定义 Agent 时，增加一层本地安全防护：扫描高风险集成、把模型流量接入本地 Guard Proxy、拦截危险动作，并留下可读的本地安全事件记录。
 
 [English](./README.md) | [快速开始](./docs/quickstart.md) | [安装](./docs/install.md) | [架构](./docs/architecture.md) | [隐私](./docs/privacy.md)
 
@@ -26,7 +26,9 @@ Qise 有三个入口：
 | 终端/CLI 用户 | `qise` CLI | 可以扫描、保护 Agent、查看事件，并把检查流程写进脚本。 |
 | Agent 开发者 | SDK / adapters | 可以把 Qise 检查接入 LangGraph、OpenAI Agents SDK、Nanobot、Hermes 或 NexAU。 |
 
-桌面应用和 CLI 使用同一套 Python Qise 产品引擎。UI 不是另一套实现，所以 CLI 和 UI 的保护行为会保持一致。
+桌面应用和 CLI 使用同一套 Python Qise 产品引擎。建议先做 **安全体检**，再通过 **智能保护** 接入受支持的智能体。**增强检测** 是可选项：扫描、确定性规则、事件和配置恢复无需 Ollama、模型下载或 GPU。
+
+智能保护是一组预设，不是新增的 Guard 模式。默认对命令、文件路径、网络、凭据和工具策略执行规则拦截，其余语义类守卫默认观察。启用模型不会自动把所有提醒改成拦截。详见 [保护行为与升级设计](./docs/protection-upgrade.md)。
 
 ## Qise 能做什么
 
@@ -46,10 +48,10 @@ AI Agent -> Qise local proxy -> 你原本使用的模型 API
 
 Qise 可以：
 
-- 检测 Codex、OpenClaw、Claude Code 等受支持 Agent。
+- 检测 Codex、OpenClaw、Claude Code、OpenCode 等受支持 Agent；扫描 WorkBuddy 资产并提供手动接入说明。
 - 在修改 Agent 配置前自动备份。
 - 把 Agent 流量接入本地 Guard Proxy。
-- 在工具调用真正触达系统前进行检查。
+- 在代理把受支持的客户端工具调用交给智能体前检查其内容。
 - 阻断危险命令，例如破坏性 shell 操作。
 - 对可疑文件、网络、凭据和数据外传行为发出警告或拦截。
 - 在信任 skill、MCP config、Agent config 前进行预检扫描。
@@ -65,13 +67,13 @@ Qise 是 local-first 的。默认情况下，产品状态、备份和事件都�
 
 ## 当前状态
 
-Qise 目前处于 alpha/MVP 阶段。Windows x64 和 macOS Apple Silicon 的稳定桌面版本通过 GitHub Releases 分发。Tauri 自动更新包已经签名，但 Windows Authenticode 签名和 Apple Developer ID 公证仍属于后续发布加固工作。
+Qise 目前处于 alpha/MVP 阶段。Windows x64 和 macOS Apple Silicon 的桌面构建通过 GitHub Releases 分发。Tauri 自动更新包已经签名，但 Windows Authenticode 签名和 Apple Developer ID 公证仍属于后续发布加固工作。
 
 | 模块 | 当前能力 | 状态 |
 | --- | --- | --- |
 | 桌面应用 | Tauri 2 + React UI，调用同一套 Qise CLI/产品引擎 | 源码构建 MVP |
 | CLI | `doctor`、`status`、`agents`、`scan`、`check`、`events`、`protect`、`restore`、`stop`、`slm`、`run` | MVP 可用 |
-| Proxy 防护 | 支持 OpenAI-compatible `/v1/chat/completions` 和 Anthropic `/v1/messages` 的本地 proxy | MVP 可用 |
+| Proxy 防护 | 支持 HTTP Chat Completions、Responses 和 Anthropic Messages；详见 [协议边界](./docs/integration.md#http-protocol-coverage) | MVP 可用 |
 | Claude Code | 原生 Anthropic Messages proxy，支持请求/响应解析、安全上下文注入和 streaming `tool_use` 检查 | MVP 可用 |
 | 预检扫描 | 扫描 skill、MCP config、Agent config 和自动检测到的 Agent 资产 | MVP 可用 |
 | Guard 引擎 | 14 类 Guard，覆盖 ingress、egress 和 output 三条流水线 | MVP 可用 |
@@ -109,7 +111,7 @@ Windows：
 
 Windows 测试安装包尚未签名，因此 Windows SmartScreen 可能显示未知发布者警告。
 
-当前 Qise 0.2.0 是第一个包含自动更新器的构建。安装过早期 0.2.0 构建的用户仍需手动覆盖安装一次，因为自动更新只能识别更高的版本号。之后 Qise 会在启动后检查稳定更新，并在未保护 Agent 时自动下载安装和重启；如果正在保护 Agent，则延迟到后续安全启动。可以在 `设置 -> 应用更新` 查看状态或手动检查。
+当前 Qise 0.2.0 是第一个包含自动更新器的构建。安装过早期 0.2.0 构建的用户仍需手动覆盖安装一次，因为自动更新只能识别更高的版本号。之后 Qise 会在启动后检查稳定更新；如果保护状态尚未确认，或仍有智能体保留 Qise 接入配置（包括服务已停止的情况），会延迟自动安装和重启。可以在 `设置 -> 应用更新` 查看状态或手动检查。
 
 ### 方式 B：从源码构建 macOS App
 
@@ -169,14 +171,14 @@ src-ui/node_modules/.bin/tauri dev
 
 ## 第一次使用桌面应用
 
-1. 打开 `Qise.app`。
-2. 在首页点击 `Detect Agents`。
-3. 进入 `Agent Shield`。
-4. 选择 Codex、OpenClaw 或 Claude Code 等 Agent。
-5. 检查上游模型 API 地址。
-6. 点击 `Protect`。
-7. 像平时一样使用你的 Agent。
-8. 回到 Qise，打开 `Security Events` 查看告警和拦截记录。
+1. 打开 Qise，在首页点击 **一键安全体检**。
+2. 查看智能体配置、技能和 MCP 资产的检查结果。
+3. 进入 **智能保护**，选择受支持的智能体。
+4. 检查上游模型 API 地址，再点击 **保护**。
+5. 确认智能体状态为已保护，然后像平时一样使用。
+6. 在 **安全事件** 查看提醒与拦截；需要模型审查时，再按需开启 **增强检测**。
+
+安全体检是一次配置检查，不会自动开启运行时防护。服务就绪也不代表智能体已经接入。已有接入在服务停止或配置不匹配时会显示“保护需修复”，此时仍可使用“恢复”。
 
 如果保护 Claude Code，请确认 Anthropic key 在环境中可用：
 
@@ -199,7 +201,7 @@ qise stop
 
 ## 从源码安装 CLI
 
-如果你更喜欢终端，可以把 Qise 安装成 Python 包：
+如果你更喜欢终端，可以把 Qise 安装成 Python 包。基础依赖不包含模型运行时或 MCP 服务端；`[proxy]` 额外提供配置监听：
 
 ```bash
 git clone https://github.com/WhitzardAgent/qise.git
@@ -220,6 +222,8 @@ qise doctor # 检查 Python、Qise import、配置、本地端口、事件日志
 | `source .venv/bin/activate` | 激活这个环境。 |
 | `pip install -e ".[proxy]"` | 以 editable 模式安装 Qise，并安装 proxy 运行时依赖。 |
 | `qise doctor` | 检查 Python、Qise import、配置、本地端口、事件日志、可选 SLM 和已检测 Agent。 | -->
+
+只有需要把 Qise 作为 MCP 服务提供工具时，才需安装额外依赖：`pip install -e ".[mcp]"`。扫描 MCP 配置文件无需安装此项。
 
 如果要开发和跑测试：
 
@@ -308,6 +312,25 @@ qise events --limit 10
 qise protect codex --base-url https://api.openai.com/v1
 ```
 
+保护 OpenCode 当前选中的 provider：
+
+```bash
+qise protect opencode
+# 无法推断上游时：
+qise protect opencode --base-url https://api.example.com/v1
+```
+
+只修改检测到的全局 JSON/JSONC 配置中当前选中的 provider，保留其他 provider。项目级配置可能覆盖全局配置，需确认项目实际使用的路由。
+
+WorkBuddy 当前支持扫描与自定义模型手动接入：
+
+```bash
+qise scan agent workbuddy
+qise protect custom --base-url https://api.example.com/v1
+```
+
+随后在 WorkBuddy 自定义模型设置中填写命令打印的 Qise 地址。`qise protect workbuddy` 不会自动改写配置，也不会把内置模型流量或手动连接自动判定为已保护。
+
 保护 OpenClaw：
 
 ```bash
@@ -350,6 +373,8 @@ qise restore all
 qise stop
 ```
 
+恢复会撤销 Qise 的配置修改，并尽量保留接入后修改的无关设置。若 Qise provider 区块发生无法安全合并的冲突，命令会报错并保留当前配置；请检查仍保留的备份。`qise stop` 也会先恢复所有接入配置，全部成功后才停止服务；恢复失败时保留服务，避免智能体继续连接已停止的代理。
+
 ## CLI 命令地图
 
 | 命令 | 适合什么时候用 |
@@ -360,7 +385,7 @@ qise stop
 | `qise agents` | 检测已安装的受支持 Agent。 |
 | `qise protect <agent>` | 备份并把 Agent 接入 Qise。 |
 | `qise restore <agent|all>` | 恢复被 Qise 修改过的 Agent 配置。 |
-| `qise stop` | 停止 Qise 管理的后台服务。 |
+| `qise stop` | 先恢复接入配置再停止服务；恢复失败则保留服务。 |
 | `qise scan all` | 自动扫描检测到的 Agent 资产。 |
 | `qise scan agent <agent>` | 扫描某个 Agent 的配置、skill 文件和 MCP 候选配置。 |
 | `qise scan skill <path>` | 扫描 skill 目录或文件。 |
@@ -370,10 +395,11 @@ qise stop
 | `qise events` | 读取本地安全事件。 |
 | `qise slm start/status/stop` | 配置或禁用可选本地 SLM 审查层。 |
 | `qise run --agent <name> -- <cmd>` | 在 Runtime Observer 下运行命令。 |
-| `qise guards` | 列出已注册 Guard、流水线、策略和模式。 |
+| `qise guards --json` | 读取去重后的实际守卫策略。 |
+| `qise guards --set prompt observe --json` | 持久化修改桌面、CLI、代理与 Bridge 共用的模式。 |
 | `qise context <tool>` | 预览某个工具对应的安全上下文文本。 |
 | `qise proxy start` | 手动启动本地 OpenAI-compatible/Anthropic proxy。 |
-| `qise bridge start` | 启动桌面/Guard 控制流程使用的本地 bridge。 |
+| `qise bridge start` | 启动守卫集成使用的本地 Bridge；桌面策略修改统一走 CLI。 |
 | `qise serve --transport stdio` | 以 MCP server 形式启动 Qise。 |
 | `qise adapters <name>` | 打印支持框架的 SDK 集成片段。 |
 
@@ -406,20 +432,29 @@ Qise 通过三条流水线运行检查：
 | `output` | 检查最终输出中的敏感或高风险内容。 |
 | `reasoning` | 在可用时，对模型/工具推理信号进行可选语义审查。 |
 
-低误报的 rules-first Guard 默认是 `enforce`。AI-first Guard 默认是 `observe`，除非你启用并调优本地 SLM 层。
+“智能保护”是现有模式的预设：`command`、`filesystem`、`network`、`credential`、`tool_policy` 默认 `enforce`，其他守卫默认 `observe`。添加模型不会自动更改这些模式。
+
+桌面、CLI、产品代理和 Bridge 使用同一份持久化策略：
+
+```bash
+qise guards --json
+qise guards --set prompt observe --json
+```
+
+覆盖值保存在 `~/.qise/guard-policy.json`，运行中的产品代理和 Bridge 在下次检查时读取，无需重启。独立 SDK `Shield` 实例仍由自身配置控制。
 
 ## 可选本地 SLM
 
-Qise 默认可以只靠规则运行。SLM 层用于补充语义审查，处理单纯规则不容易覆盖的场景。
+Qise 默认不配置或启动模型，安全体检、规则保护、事件和配置恢复均可独立使用。SLM 是可选的增强检测，用于补充语义审查。
 
-启动默认本地 SLM 设置：
+明确选择启用本地 SLM 时：
 
 ```bash
 qise slm start
 qise slm status
 ```
 
-默认情况下，Qise 使用本机 Ollama 的 `http://localhost:11434/v1` 和 `qwen3:4b`。首次运行时，如果缺少 Ollama 或模型，Qise 可以尝试自动安装和拉取。
+显式运行 `qise slm start` 才会使用本机 Ollama 的 `http://localhost:11434/v1` 和 `qwen3:4b`。首次运行时，如果缺少 Ollama 或模型，命令可能尝试安装和拉取；这不是普通启动或智能保护的必要步骤。
 
 使用其他模型：
 
@@ -439,9 +474,10 @@ qise slm start --base-url http://localhost:8000/v1 --model my-security-model
 qise slm stop
 ```
 
-如果 Qise proxy/protection 已经在运行，修改 SLM 状态后需要重新启动防护：
+如果代理已运行，修改 SLM endpoint/model 后应先恢复接入配置，再重启服务并重新接入。修改守卫模式则无需重启：
 
 ```bash
+qise restore codex
 qise stop
 qise protect codex
 ```
@@ -548,6 +584,7 @@ qise init
 
 ```text
 ~/.qise/state.json       # 当前服务、受保护 Agent、SLM 状态
+~/.qise/guard-policy.json # 持久化的守卫模式覆盖
 ~/.qise/events.jsonl     # 本地安全事件
 ~/.qise/backups/         # patch Agent 配置前创建的备份
 ~/.qise/logs/            # Qise 管理的 proxy/bridge stdout 和 stderr 日志
@@ -619,13 +656,16 @@ qise events --limit 5
 ## 当前限制
 
 - 当前仓库中的 macOS 和 Windows 安装包均为未签名测试构建。
-- Proxy 模式当前主要面向 OpenAI-compatible chat/completions 流量和 Anthropic Messages `/v1/messages` 流量。
+- HTTP 代理覆盖 Chat Completions、Anthropic Messages 及受支持的 Responses 文本/函数/自定义工具流程。WebSocket、上游托管工具的实际执行和未识别 API 路由不在执行拦截范围；流式文本交付后才进行输出审计，详见 [协议边界](./docs/integration.md#http-protocol-coverage)。
+- 服务身份健康、配置匹配不等于覆盖智能体的一切执行。项目配置覆盖、内置模型通道和绕过 Qise 的调用仍可能不经过代理。
+- 历史评测采用旧的模式选择和指标口径。请使用修正后的 [评估工具](./eval/README.md)，不要把检测 F1 当作阻断成功率。
 - Runtime Observer 是用户态 wrapper，不是 OS/kernel 级审计。
 - 本地 SLM 的质量和延迟取决于你选择的模型与服务。
 - Windows EXE 由 GitHub Actions 的 Windows runner 生成，不能直接在 macOS 上进行最终安装测试。
 
 ## 了解更多
 
+- [保护行为与升级设计](./docs/protection-upgrade.md)
 - [安装](./docs/install.md)
 - [快速开始](./docs/quickstart.md)
 - [架构](./docs/architecture.md)

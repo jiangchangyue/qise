@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from collections import deque
 from contextlib import suppress
@@ -29,6 +30,8 @@ from qise.bridge.protocol import (
     GuardResultSummary,
 )
 from qise.core.models import GuardContext
+from qise.product.policy import guard_rows, refresh_guard_policy, set_guard_mode
+from qise.product.privacy import redact_text
 
 logger = logging.getLogger("qise.bridge")
 
@@ -99,7 +102,8 @@ class BridgeServer:
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
                 "guard_name": gr.guard,
                 "verdict": gr.verdict,
-                "message": gr.message,
+                "message": redact_text(gr.message),
+                "evidence_kind": gr.evidence_kind,
             }
             self._event_buffer.append(event_data)
             # Push to WebSocket clients
@@ -155,9 +159,11 @@ class BridgeServer:
         This runs synchronously in a thread pool, so it can call the
         synchronous Shield pipeline methods (which may call SLM via httpx).
         """
+        refresh_guard_policy(self._shield)
+        config = self._shield.config
         guard_modes = {
-            name: self._shield.config.guard_mode(name)
-            for name in self._shield.config.guards.enabled
+            name: config.guard_mode(name)
+            for name in config.guards.enabled
         }
 
         start = time.monotonic()
@@ -324,11 +330,13 @@ class BridgeServer:
                 verdict=str(gr.verdict) if gr.verdict else "pass",
                 message=gr.message or "",
                 latency_ms=gr.latency_ms or 0,
+                evidence_kind=gr.evidence_kind,
             ))
         return summaries
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         """Handle GET /v1/bridge/health."""
+        from qise.product.service import profile_id
         slm_available = self._shield.model_router.is_available("slm")
 
         # Determine SLM mode: local (localhost/11434), cloud, or unavailable
@@ -339,6 +347,10 @@ class BridgeServer:
 
         return web.json_response({
             "status": "ok",
+            "service": "qise-bridge",
+            "pid": os.getpid(),
+            "instance_id": os.environ.get("QISE_SERVICE_INSTANCE", ""),
+            "profile_id": profile_id(),
             "slm_available": slm_available,
             "slm_mode": slm_mode,
             "slm_latency_ms": self._last_slm_latency_ms,
@@ -354,19 +366,7 @@ class BridgeServer:
 
     async def _handle_guards(self, request: web.Request) -> web.Response:
         """Handle GET /v1/bridge/guards — return all guards with real mode + strategy."""
-        guards = []
-        try:
-            for g in self._shield.pipeline.all_guards:
-                pipeline = self._get_pipeline_for_guard(g.name)
-                guards.append({
-                    "name": g.name,
-                    "mode": getattr(g, "mode", "observe"),
-                    "pipeline": pipeline,
-                    "primary_strategy": getattr(g, "primary_strategy", "rules"),
-                })
-        except Exception as e:
-            logger.warning("Failed to enumerate guards: %s", e)
-        return web.json_response(guards)
+        return web.json_response(guard_rows(self._shield))
 
     async def _handle_events(self, request: web.Request) -> web.Response:
         """Handle GET /v1/bridge/events — return recent security events."""
@@ -376,11 +376,24 @@ class BridgeServer:
 
     async def _handle_set_guard_mode(self, request: web.Request) -> web.Response:
         """Handle POST /v1/bridge/guard/mode — set a guard's mode."""
+        # The desktop writes policy through the CLI. Do not allow web pages to
+        # change local protections: CORS does not prevent simple POST writes.
+        if "Origin" in request.headers:
+            return web.json_response(
+                {"error": "Browser-origin policy writes are not allowed; use the Qise CLI"},
+                status=403,
+            )
+        if request.content_type != "application/json":
+            return web.json_response(
+                {"error": "Policy writes require application/json"}, status=415,
+            )
         try:
             body = await request.json()
         except Exception as e:
             return web.json_response({"error": f"Invalid JSON: {e}"}, status=400)
 
+        if not isinstance(body, dict):
+            return web.json_response({"error": "Expected a JSON object"}, status=400)
         guard_name = body.get("guard_name", "")
         mode = body.get("mode", "")
         if not guard_name or not mode:
@@ -396,11 +409,13 @@ class BridgeServer:
         try:
             for g in self._shield.pipeline.all_guards:
                 if g.name == guard_name:
-                    g.mode = mode
+                    set_guard_mode(guard_name, mode)
+                    refresh_guard_policy(self._shield)
                     logger.info("Set guard '%s' mode to '%s'", guard_name, mode)
                     return web.json_response({"ok": True})
         except Exception as e:
             logger.warning("Failed to set guard mode: %s", e)
+            return web.json_response({"error": "Could not save guard policy; existing protection was retained"}, status=500)
 
         return web.json_response({"error": f"Guard not found: {guard_name}"}, status=404)
 

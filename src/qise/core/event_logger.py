@@ -12,6 +12,8 @@ import sys
 from datetime import UTC, datetime
 from typing import Any
 
+from qise.product.privacy import redact_evidence
+
 
 class EventLogger:
     """Structured JSON logger for security events.
@@ -62,7 +64,7 @@ class EventLogger:
         if result.risk_attribution:
             event["risk_attribution"] = result.risk_attribution.model_dump()
 
-        self._logger.info(json.dumps(event, default=str))
+        self._logger.info(json.dumps(redact_evidence(event), default=str))
 
     def log_pipeline_result(self, session_id: str, result: Any) -> None:
         """Log a pipeline result as structured JSON."""
@@ -80,7 +82,7 @@ class EventLogger:
             "guard_count": len(result.results),
             "warnings": result.warnings,
         }
-        self._logger.info(json.dumps(event, default=str))
+        self._logger.info(json.dumps(redact_evidence(event), default=str))
 
     def log_event(self, event_type: str, data: dict[str, Any]) -> None:
         """Log a custom event as structured JSON."""
@@ -89,4 +91,4 @@ class EventLogger:
             "event_type": event_type,
             **data,
         }
-        self._logger.info(json.dumps(event, default=str))
+        self._logger.info(json.dumps(redact_evidence(event), default=str))

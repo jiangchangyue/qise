@@ -5,20 +5,14 @@ Uses mock objects instead of real framework dependencies.
 
 from __future__ import annotations
 
-import asyncio
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import MagicMock, patch
 
 import pytest
 
-from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin
 from qise.adapters.langgraph import QiseLangGraphWrapper
-from qise.adapters.nanobot import QiseNanobotHook
 from qise.adapters.nexau import QiseNexauMiddleware
 from qise.adapters.openai_agents import QiseOpenAIAgentsGuardrails
 from qise.core.shield import Shield
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -69,8 +63,8 @@ class TestNexauMiddleware:
         assert safe_tc in parsed_response.tool_calls
 
     @pytest.mark.asyncio
-    async def test_before_tool_clears_input_on_block(self, shield: Shield) -> None:
-        """before_tool should clear tool_input when blocked."""
+    async def test_before_tool_stops_execution_on_block(self, shield: Shield) -> None:
+        """A blocked tool must not run with empty or default arguments."""
         mw = QiseNexauMiddleware(shield)
         mw.install()
 
@@ -79,10 +73,9 @@ class TestNexauMiddleware:
             tool_input={"command": "rm -rf /"},
         )
 
-        await mw.before_tool(context)
-
-        # CommandGuard in enforce mode should block rm -rf /
-        assert context.tool_input == {"__qise_blocked": True}
+        with pytest.raises(RuntimeError, match="blocked"):
+            await mw.before_tool(context)
+        assert context.tool_input == {"command": "rm -rf /"}
 
     @pytest.mark.asyncio
     async def test_after_tool_checks_result(self, shield: Shield) -> None:

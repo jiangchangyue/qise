@@ -1,12 +1,13 @@
 """Tests for GuardPipeline with real guards."""
 
+from pathlib import Path
+
 from qise.core.models import GuardContext, GuardMode, GuardResult, GuardVerdict
 from qise.core.pipeline import GuardPipeline, PipelineKind, SubPipeline
+from qise.data.pattern_loader import ThreatPatternLoader
 from qise.guards.command import CommandGuard
 from qise.guards.credential import CredentialGuard
 from qise.guards.prompt import PromptGuard
-from qise.data.pattern_loader import ThreatPatternLoader
-from pathlib import Path
 
 
 class TestSubPipelineBlockShortCircuit:
@@ -68,8 +69,8 @@ class TestSubPipelineOffMode:
 
 class TestSubPipelineGuardError:
 
-    def test_guard_error_returns_warn(self) -> None:
-        """Guard crash should produce conservative WARN, not fail-open."""
+    def test_guard_error_blocks_by_default(self) -> None:
+        """An enforcing guard crash must stop the checked action."""
 
         class FailingGuard(CommandGuard):
             name = "failing"
@@ -81,8 +82,9 @@ class TestSubPipelineGuardError:
         sub = SubPipeline(PipelineKind.EGRESS, [guard])
         ctx = GuardContext(tool_name="bash", tool_args={"command": "ls"})
         result = sub.run(ctx)
-        assert result.verdict == GuardVerdict.WARN
-        assert "error" in result.warnings[0].lower()
+        assert result.verdict == GuardVerdict.BLOCK
+        assert result.should_block
+        assert "error" in result.results[0].message.lower()
 
 
 class TestGuardPipelineRegistration:

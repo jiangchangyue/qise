@@ -1,8 +1,12 @@
 """Tests for MCP Server tool handlers — end-to-end integration."""
 
 import json
+import os
+from contextlib import asynccontextmanager
 
-from qise.core.models import GuardVerdict
+import pytest
+
+from qise import mcp_server
 from qise.core.shield import Shield
 from qise.mcp_server import (
     _handle_check_content,
@@ -113,3 +117,71 @@ class TestMCPGetSecurityContext:
         })
         text = result[0].text
         assert text == ""
+
+
+class TestMCPProductConfiguration:
+    @pytest.fixture(autouse=True)
+    def isolate_product_configuration(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("QISE_HOME", str(tmp_path / "qise"))
+        monkeypatch.delenv("QISE_CONFIG", raising=False)
+        monkeypatch.delenv("QISE_MODE", raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(mcp_server, "_requested_config_path", None)
+        monkeypatch.setattr(mcp_server._get_shield, "_instance", None, raising=False)
+
+    @pytest.mark.asyncio
+    async def test_home_config_and_live_guard_policy_control_mcp_checks(self, tmp_path):
+        from qise.product.policy import policy_path, set_guard_mode
+
+        home = tmp_path / "qise"
+        home.mkdir()
+        (home / "shield.yaml").write_text(
+            "guards:\n  enabled: [command]\n  config:\n    command:\n      mode: 'off'\n",
+        )
+        (tmp_path / "shield.yaml").write_text(
+            "guards:\n  enabled: [command]\n  config:\n    command:\n      mode: enforce\n",
+        )
+        arguments = {"tool_name": "bash", "tool_args": {"command": "rm -rf /"}}
+
+        unchecked = json.loads((await mcp_server.call_tool("qise_check_tool_call", arguments))[0].text)
+        assert unchecked["verdict"] == "pass"
+        shield = mcp_server._get_shield()
+
+        set_guard_mode("command", "enforce")
+        enforced = json.loads((await mcp_server.call_tool("qise_check_tool_call", arguments))[0].text)
+        assert enforced["should_block"] is True
+        assert enforced["verdict"] == "block"
+        enforced_stat = policy_path().stat()
+
+        set_guard_mode("command", "observe")
+        # Atomic replacements can share size and mtime on coarse filesystems.
+        os.utime(policy_path(), ns=(enforced_stat.st_atime_ns, enforced_stat.st_mtime_ns))
+        observed = json.loads((await mcp_server.call_tool("qise_check_tool_call", arguments))[0].text)
+        assert observed["should_block"] is False
+        assert observed["verdict"] == "warn"
+        assert mcp_server._get_shield() is shield
+
+    @pytest.mark.asyncio
+    async def test_main_explicit_config_overrides_environment_config(self, tmp_path, monkeypatch):
+        explicit = tmp_path / "explicit.yaml"
+        explicit.write_text(
+            "guards:\n  enabled: [command]\n  config:\n    command:\n      mode: enforce\n",
+        )
+        environment = tmp_path / "environment.yaml"
+        environment.write_text("guards:\n  enabled: []\n")
+        monkeypatch.setenv("QISE_CONFIG", str(environment))
+        assert mcp_server._get_shield().config.guards.enabled == []
+
+        @asynccontextmanager
+        async def stdio():
+            yield object(), object()
+
+        async def run(*_args):
+            response = await mcp_server.call_tool("qise_check_tool_call", {
+                "tool_name": "bash", "tool_args": {"command": "rm -rf /"},
+            })
+            assert json.loads(response[0].text)["should_block"] is True
+
+        monkeypatch.setattr(mcp_server, "stdio_server", stdio)
+        monkeypatch.setattr(mcp_server.app, "run", run)
+        await mcp_server.main(config_path=str(explicit))

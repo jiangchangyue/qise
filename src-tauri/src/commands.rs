@@ -1,12 +1,12 @@
 //! Tauri IPC commands called from the React frontend.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::State;
 
 use crate::{qise_cli, SharedState};
 
-#[derive(Serialize)]
+#[derive(Deserialize, Serialize)]
 pub struct GuardInfo {
     name: String,
     mode: String,
@@ -296,53 +296,24 @@ pub async fn get_takeover_status() -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub async fn get_guards(state: State<'_, SharedState>) -> Result<Vec<GuardInfo>, String> {
-    let bridge_port = {
-        let s = state.lock().await;
-        s.bridge_port
-    };
-
-    let bridge_url = format!("http://127.0.0.1:{}", bridge_port);
-    let client = crate::guard_client::GuardClient::new(&bridge_url, 5);
-    if let Ok(guards) = client.get_guards().await {
-        let parsed: Vec<GuardInfo> = guards.into_iter().filter_map(guard_from_value).collect();
-        if !parsed.is_empty() {
-            return Ok(parsed);
-        }
-    }
-
-    if let Ok(output) = qise_cli::run(qise_cli::args_with_default_config(&["guards"])).await {
-        let parsed = parse_guard_text(&output.stdout);
-        if !parsed.is_empty() {
-            return Ok(parsed);
-        }
-    }
-
-    Ok(default_guards())
+pub async fn get_guards() -> Result<Vec<GuardInfo>, String> {
+    let value =
+        qise_cli::run_json(qise_cli::args_with_default_config(&["guards", "--json"])).await?;
+    serde_json::from_value(value)
+        .map_err(|error| format!("Invalid Qise guards response: {}", error))
 }
 
 #[tauri::command]
-pub async fn set_guard_mode(
-    guard_name: String,
-    mode: String,
-    state: State<'_, SharedState>,
-) -> Result<(), String> {
-    let bridge_port = {
-        let s = state.lock().await;
-        s.bridge_port
-    };
-
-    let bridge_url = format!("http://127.0.0.1:{}", bridge_port);
-    let client = crate::guard_client::GuardClient::new(&bridge_url, 5);
-    client
-        .set_guard_mode(&guard_name, &mode)
-        .await
-        .map_err(|e| {
-            format!(
-                "Guard mode can only be changed while the Qise bridge is running. Bridge error: {}",
-                e
-            )
-        })
+pub async fn set_guard_mode(guard_name: String, mode: String) -> Result<(), String> {
+    qise_cli::run_json(qise_cli::args_with_default_config(&[
+        "guards",
+        "--set",
+        &guard_name,
+        &mode,
+        "--json",
+    ]))
+    .await?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -419,54 +390,6 @@ pub async fn get_default_config() -> Result<Value, String> {
     Ok(default_config())
 }
 
-fn guard_from_value(value: Value) -> Option<GuardInfo> {
-    Some(GuardInfo {
-        name: value.get("name")?.as_str()?.to_string(),
-        mode: value
-            .get("mode")
-            .and_then(|item| item.as_str())
-            .unwrap_or("observe")
-            .to_string(),
-        pipeline: value
-            .get("pipeline")
-            .and_then(|item| item.as_str())
-            .unwrap_or("unknown")
-            .to_string(),
-        primary_strategy: value
-            .get("primary_strategy")
-            .and_then(|item| item.as_str())
-            .unwrap_or("rules")
-            .to_string(),
-    })
-}
-
-fn parse_guard_text(text: &str) -> Vec<GuardInfo> {
-    text.lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty()
-                || trimmed.starts_with("Name")
-                || trimmed.starts_with("---")
-                || trimmed.starts_with("Total:")
-            {
-                return None;
-            }
-
-            let cols: Vec<&str> = trimmed.split_whitespace().collect();
-            if cols.len() < 4 {
-                return None;
-            }
-
-            Some(GuardInfo {
-                name: cols[0].to_string(),
-                pipeline: cols[1].to_string(),
-                primary_strategy: cols[2].to_string(),
-                mode: cols[3].to_string(),
-            })
-        })
-        .collect()
-}
-
 fn default_config_path() -> Result<String, String> {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -491,7 +414,7 @@ fn default_config() -> Value {
         "models": {
             "slm": {
                 "base_url": "http://localhost:11434/v1",
-                "model": "qwen3:4b",
+                "model": "",
                 "timeout_ms": 5000
             },
             "llm": {
@@ -509,93 +432,4 @@ fn default_config() -> Value {
             "config": {}
         }
     })
-}
-
-fn default_guards() -> Vec<GuardInfo> {
-    vec![
-        GuardInfo {
-            name: "prompt".into(),
-            mode: "observe".into(),
-            pipeline: "ingress".into(),
-            primary_strategy: "ai".into(),
-        },
-        GuardInfo {
-            name: "tool_sanity".into(),
-            mode: "observe".into(),
-            pipeline: "ingress".into(),
-            primary_strategy: "ai".into(),
-        },
-        GuardInfo {
-            name: "context".into(),
-            mode: "observe".into(),
-            pipeline: "ingress".into(),
-            primary_strategy: "ai".into(),
-        },
-        GuardInfo {
-            name: "supply_chain".into(),
-            mode: "observe".into(),
-            pipeline: "ingress".into(),
-            primary_strategy: "ai".into(),
-        },
-        GuardInfo {
-            name: "command".into(),
-            mode: "enforce".into(),
-            pipeline: "egress".into(),
-            primary_strategy: "rules".into(),
-        },
-        GuardInfo {
-            name: "reasoning".into(),
-            mode: "observe".into(),
-            pipeline: "egress".into(),
-            primary_strategy: "ai".into(),
-        },
-        GuardInfo {
-            name: "filesystem".into(),
-            mode: "enforce".into(),
-            pipeline: "egress".into(),
-            primary_strategy: "rules".into(),
-        },
-        GuardInfo {
-            name: "network".into(),
-            mode: "enforce".into(),
-            pipeline: "egress".into(),
-            primary_strategy: "rules".into(),
-        },
-        GuardInfo {
-            name: "exfil".into(),
-            mode: "observe".into(),
-            pipeline: "egress".into(),
-            primary_strategy: "ai".into(),
-        },
-        GuardInfo {
-            name: "resource".into(),
-            mode: "observe".into(),
-            pipeline: "egress".into(),
-            primary_strategy: "rules".into(),
-        },
-        GuardInfo {
-            name: "tool_policy".into(),
-            mode: "enforce".into(),
-            pipeline: "egress".into(),
-            primary_strategy: "rules".into(),
-        },
-        GuardInfo {
-            name: "credential".into(),
-            mode: "enforce".into(),
-            pipeline: "output".into(),
-            primary_strategy: "rules".into(),
-        },
-        GuardInfo {
-            name: "audit".into(),
-            mode: "observe".into(),
-            pipeline: "output".into(),
-            primary_strategy: "rules".into(),
-        },
-        GuardInfo {
-            name: "output".into(),
-            mode: "observe".into(),
-            pipeline: "output".into(),
-            primary_strategy: "ai".into(),
-        },
-    ]
 }

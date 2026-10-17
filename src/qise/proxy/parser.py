@@ -1,60 +1,49 @@
-"""Request/Response parser for OpenAI-compatible and Anthropic API formats.
+"""Normalize supported model API messages for guard inspection.
 
-Parses model requests and responses to extract:
-  - User messages, tool results, tool descriptions from requests
-  - Tool calls, reasoning, text content from responses
+Text paths retain the location of inspected input so isolation/sanitization can
+be written back without dropping images or changing the surrounding protocol.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-# ---------------------------------------------------------------------------
-# Parsed structures
-# ---------------------------------------------------------------------------
-
 
 class ParsedToolCall(BaseModel):
-    """A single tool call extracted from a response."""
-
     tool_name: str
-    tool_args: dict[str, Any] = {}
+    tool_args: dict[str, Any] = Field(default_factory=dict)
     call_id: str = ""
+    arguments_valid: bool = True
 
 
 class ParsedMessage(BaseModel):
-    """A single message extracted from a request or response."""
-
     role: str
     content: str = ""
     tool_calls: list[ParsedToolCall] = Field(default_factory=list)
     tool_call_id: str = ""
     trust_boundary: str | None = None
+    content_paths: list[list[str | int]] = Field(default_factory=list)
 
 
 class ParsedToolDef(BaseModel):
-    """A tool definition extracted from the request's tools array."""
-
     name: str
     description: str = ""
     parameters: dict[str, Any] = Field(default_factory=dict)
 
 
 class ParsedRequest(BaseModel):
-    """Structured representation of a chat completion request."""
-
     model: str = ""
     messages: list[ParsedMessage] = Field(default_factory=list)
     tools: list[ParsedToolDef] = Field(default_factory=list)
     stream: bool = False
     raw_body: dict[str, Any] = Field(default_factory=dict)
+    api_format: str = "openai"
 
 
 class ParsedResponse(BaseModel):
-    """Structured representation of a chat completion response."""
-
     content: str = ""
     tool_calls: list[ParsedToolCall] = Field(default_factory=list)
     reasoning: str = ""
@@ -63,379 +52,329 @@ class ParsedResponse(BaseModel):
     raw_body: dict[str, Any] = Field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Trust boundary inference
-# ---------------------------------------------------------------------------
-
-_TRUST_BOUNDARY_MAP: dict[str, str] = {
-    "user": "user_input",
-    "tool": "tool_result",
-}
-
-
 def _infer_trust_boundary(role: str, msg: dict[str, Any]) -> str | None:
-    """Infer the trust boundary from a message's role and content."""
-    if role == "user":
-        # Check if this is a tool_result message
-        if msg.get("tool_call_id") or msg.get("name"):
-            return "tool_result"
-        return "user_input"
-    if role == "assistant":
-        return "agent_message"
-    if role == "system":
-        return "context_file"
-    return None
+    if role == "tool" or (role == "user" and (msg.get("tool_call_id") or msg.get("name"))):
+        return "tool_result"
+    return {
+        "user": "user_input",
+        "assistant": "agent_message",
+        "system": "context_file",
+        "developer": "context_file",
+    }.get(role)
+
+
+def _text_parts(value: Any, path: list[str | int]) -> tuple[str, list[list[str | int]]]:
+    if isinstance(value, str):
+        return value, [path]
+    parts: list[str] = []
+    paths: list[list[str | int]] = []
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            if isinstance(item, str):
+                text, locations = item, [path + [index]]
+            elif isinstance(item, dict) and item.get("type") in {"text", "input_text", "output_text", "summary_text"}:
+                text, locations = _text_parts(item.get("text"), path + [index, "text"])
+            else:
+                continue
+            parts.append(text)
+            paths.extend(locations)
+    return "\n".join(parts), paths
 
 
 def _extract_content_text(value: Any) -> str:
-    """Extract guard-readable text from string or content-block values."""
+    return _text_parts(value, [])[0]
+
+
+def parse_tool_arguments(value: Any) -> tuple[dict[str, Any], bool]:
+    """Never turn malformed executable arguments into an apparently safe {}."""
+    if isinstance(value, dict):
+        return value, True
     if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        parts: list[str] = []
-        for item in value:
-            if isinstance(item, str):
-                parts.append(item)
-            elif isinstance(item, dict):
-                item_type = item.get("type")
-                if item_type == "text" and isinstance(item.get("text"), str):
-                    parts.append(item["text"])
-                elif item_type == "tool_result":
-                    nested = _extract_content_text(item.get("content"))
-                    if nested:
-                        parts.append(nested)
-        return "\n".join(part for part in parts if part)
-    return ""
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed, True
+        except (ValueError, TypeError):
+            pass
+    return {"_raw_arguments": value}, False
 
 
-# ---------------------------------------------------------------------------
-# RequestParser
-# ---------------------------------------------------------------------------
+def _chat_tool_call(tc: dict[str, Any]) -> ParsedToolCall:
+    function = tc.get("function", {})
+    args, valid = parse_tool_arguments(function.get("arguments", {}))
+    return ParsedToolCall(
+        tool_name=function.get("name", ""), tool_args=args, call_id=tc.get("id", ""), arguments_valid=valid
+    )
+
+
+def responses_tool_call(item: dict[str, Any]) -> ParsedToolCall | None:
+    """Client-executed Responses tools; hosted tools are outside this boundary."""
+    kind = item.get("type")
+    if kind == "function_call":
+        args, valid = parse_tool_arguments(item.get("arguments"))
+    elif kind == "custom_tool_call":
+        value = item.get("input")
+        args, valid = {"input": value}, isinstance(value, str)
+    else:
+        return None
+    return ParsedToolCall(
+        tool_name=str(item.get("name") or ""),
+        tool_args=args,
+        call_id=str(item.get("call_id") or item.get("id") or ""),
+        arguments_valid=valid,
+    )
 
 
 class RequestParser:
-    """Parse OpenAI-compatible chat completion and Anthropic Messages requests.
-
-    Extracts messages, tool definitions, and metadata from request bodies
-    for guard inspection.
-    """
-
     def parse(self, body: dict[str, Any]) -> ParsedRequest:
-        """Parse a chat completion request body."""
-        messages: list[ParsedMessage] = []
-        for msg in body.get("messages", []):
+        messages = []
+        for index, msg in enumerate(body.get("messages", [])):
             role = msg.get("role", "")
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                # Multi-part content: extract text parts
-                text_parts = []
-                for part in content:
-                    if isinstance(part, dict) and part.get("type") == "text":
-                        text_parts.append(part.get("text", ""))
-                content = "\n".join(text_parts)
-
-            # Parse tool calls in assistant messages
-            tool_calls: list[ParsedToolCall] = []
-            for tc in msg.get("tool_calls", []):
-                func = tc.get("function", {})
-                args: dict[str, Any] = {}
-                if isinstance(func.get("arguments"), str):
-                    import json
-
-                    try:
-                        args = json.loads(func["arguments"])
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                elif isinstance(func.get("arguments"), dict):
-                    args = func["arguments"]
-
-                tool_calls.append(
-                    ParsedToolCall(
-                        tool_name=func.get("name", ""),
-                        tool_args=args,
-                        call_id=tc.get("id", ""),
-                    )
-                )
-
-            boundary = _infer_trust_boundary(role, msg)
-
+            content, paths = _text_parts(msg.get("content"), ["messages", index, "content"])
+            calls = [_chat_tool_call(tc) for tc in msg.get("tool_calls", [])]
+            if msg.get("function_call"):
+                calls.append(_chat_tool_call({"function": msg["function_call"]}))
             messages.append(
                 ParsedMessage(
                     role=role,
-                    content=content or "",
-                    tool_calls=tool_calls,
+                    content=content,
+                    content_paths=paths,
+                    tool_calls=calls,
                     tool_call_id=msg.get("tool_call_id", ""),
-                    trust_boundary=boundary,
+                    trust_boundary=_infer_trust_boundary(role, msg),
                 )
             )
-
-        # Parse tool definitions
-        tools: list[ParsedToolDef] = []
+        tools = []
         for tool in body.get("tools", []):
-            func = tool.get("function", {})
-            tools.append(
-                ParsedToolDef(
-                    name=func.get("name", ""),
-                    description=func.get("description", ""),
-                    parameters=func.get("parameters", {}),
+            function = tool.get("function", {})
+            if function:
+                tools.append(
+                    ParsedToolDef(
+                        name=function.get("name", ""),
+                        description=function.get("description", ""),
+                        parameters=function.get("parameters", {}),
+                    )
                 )
-            )
-
         return ParsedRequest(
-            model=body.get("model", ""),
-            messages=messages,
-            tools=tools,
-            stream=body.get("stream", False),
-            raw_body=body,
+            model=body.get("model", ""), messages=messages, tools=tools, stream=body.get("stream", False), raw_body=body
         )
 
     def parse_anthropic(self, body: dict[str, Any]) -> ParsedRequest:
-        """Parse an Anthropic /v1/messages request body."""
-        messages: list[ParsedMessage] = []
-
-        system_text = _extract_content_text(body.get("system"))
-        if system_text:
+        messages = []
+        system, paths = _text_parts(body.get("system"), ["system"])
+        if system:
             messages.append(
-                ParsedMessage(
-                    role="system",
-                    content=system_text,
-                    trust_boundary="context_file",
-                )
+                ParsedMessage(role="system", content=system, content_paths=paths, trust_boundary="context_file")
             )
-
-        for msg in body.get("messages", []):
-            if not isinstance(msg, dict):
-                continue
+        for index, msg in enumerate(body.get("messages", [])):
             role = msg.get("role", "")
-            content = msg.get("content", "")
-            tool_calls: list[ParsedToolCall] = []
-
+            content = msg.get("content")
+            text, paths = _text_parts(content, ["messages", index, "content"])
+            calls = []
             if isinstance(content, list):
-                text_parts: list[str] = []
-                for part in content:
-                    if not isinstance(part, dict):
+                for block_index, block in enumerate(content):
+                    if not isinstance(block, dict):
                         continue
-                    part_type = part.get("type")
-                    if part_type == "text":
-                        text = part.get("text", "")
-                        if isinstance(text, str) and text:
-                            text_parts.append(text)
-                    elif part_type == "tool_result":
-                        result_text = _extract_content_text(part.get("content"))
-                        if result_text:
-                            messages.append(
-                                ParsedMessage(
-                                    role="tool",
-                                    content=result_text,
-                                    tool_call_id=str(part.get("tool_use_id") or ""),
-                                    trust_boundary="tool_result",
-                                )
-                            )
-                    elif part_type == "tool_use":
-                        tool_calls.append(
-                            ParsedToolCall(
-                                tool_name=str(part.get("name") or ""),
-                                tool_args=part.get("input") if isinstance(part.get("input"), dict) else {},
-                                call_id=str(part.get("id") or ""),
+                    if block.get("type") == "tool_result":
+                        result, result_paths = _text_parts(
+                            block.get("content"), ["messages", index, "content", block_index, "content"]
+                        )
+                        messages.append(
+                            ParsedMessage(
+                                role="tool",
+                                content=result,
+                                content_paths=result_paths,
+                                tool_call_id=str(block.get("tool_use_id") or ""),
+                                trust_boundary="tool_result",
                             )
                         )
-
-                content_text = "\n".join(text_parts)
-            else:
-                content_text = _extract_content_text(content)
-
-            if content_text or tool_calls:
+                    elif block.get("type") == "tool_use":
+                        args, valid = parse_tool_arguments(block.get("input", {}))
+                        calls.append(
+                            ParsedToolCall(
+                                tool_name=str(block.get("name") or ""),
+                                tool_args=args,
+                                call_id=str(block.get("id") or ""),
+                                arguments_valid=valid,
+                            )
+                        )
+            if text or calls:
                 messages.append(
                     ParsedMessage(
                         role=role,
-                        content=content_text,
-                        tool_calls=tool_calls,
+                        content=text,
+                        content_paths=paths,
+                        tool_calls=calls,
                         trust_boundary=_infer_trust_boundary(role, msg),
                     )
                 )
-
-        tools: list[ParsedToolDef] = []
-        for tool in body.get("tools", []):
-            if not isinstance(tool, dict):
-                continue
-            tools.append(
-                ParsedToolDef(
-                    name=str(tool.get("name") or ""),
-                    description=str(tool.get("description") or ""),
-                    parameters=tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else {},
-                )
+        tools = [
+            ParsedToolDef(
+                name=str(tool.get("name") or ""),
+                description=str(tool.get("description") or ""),
+                parameters=tool.get("input_schema") or {},
             )
-
+            for tool in body.get("tools", [])
+        ]
         return ParsedRequest(
             model=body.get("model", ""),
             messages=messages,
             tools=tools,
             stream=body.get("stream", False),
             raw_body=body,
+            api_format="anthropic",
+        )
+
+    def parse_responses(self, body: dict[str, Any]) -> ParsedRequest:
+        messages = []
+        instructions = body.get("instructions")
+        if isinstance(instructions, str):
+            messages.append(
+                ParsedMessage(
+                    role="system", content=instructions, content_paths=[["instructions"]], trust_boundary="context_file"
+                )
+            )
+        items = body.get("input", [])
+        if isinstance(items, str):
+            messages.append(
+                ParsedMessage(role="user", content=items, content_paths=[["input"]], trust_boundary="user_input")
+            )
+        elif isinstance(items, list):
+            for index, item in enumerate(items):
+                if not isinstance(item, dict):
+                    continue
+                kind = item.get("type", "message")
+                if kind in {"function_call_output", "custom_tool_call_output"}:
+                    text, paths = _text_parts(item.get("output"), ["input", index, "output"])
+                    messages.append(
+                        ParsedMessage(
+                            role="tool",
+                            content=text,
+                            content_paths=paths,
+                            tool_call_id=str(item.get("call_id") or ""),
+                            trust_boundary="tool_result",
+                        )
+                    )
+                elif call := responses_tool_call(item):
+                    messages.append(ParsedMessage(role="assistant", tool_calls=[call], trust_boundary="agent_message"))
+                elif kind == "message":
+                    role = item.get("role", "user")
+                    text, paths = _text_parts(item.get("content"), ["input", index, "content"])
+                    messages.append(
+                        ParsedMessage(
+                            role=role,
+                            content=text,
+                            content_paths=paths,
+                            trust_boundary=_infer_trust_boundary(role, item),
+                        )
+                    )
+        tools = []
+        for tool in body.get("tools", []):
+            if tool.get("type") in {"function", "custom"}:
+                tools.append(
+                    ParsedToolDef(
+                        name=tool.get("name", ""),
+                        description=tool.get("description", ""),
+                        parameters=tool.get("parameters") or {},
+                    )
+                )
+        return ParsedRequest(
+            model=body.get("model", ""),
+            messages=messages,
+            tools=tools,
+            stream=body.get("stream", False),
+            raw_body=body,
+            api_format="responses",
         )
 
 
-# ---------------------------------------------------------------------------
-# ResponseParser
-# ---------------------------------------------------------------------------
-
-
 class ResponseParser:
-    """Parse OpenAI-compatible chat completion and Anthropic Messages responses.
-
-    Extracts tool calls, reasoning/thinking content, and text from
-    response bodies for guard inspection.
-    """
-
     def parse(self, body: dict[str, Any]) -> ParsedResponse:
-        """Parse a chat completion response body."""
-        content_parts: list[str] = []
-        tool_calls: list[ParsedToolCall] = []
-        reasoning = ""
+        contents, calls, reasoning = [], [], []
         finish_reason = ""
-        model = body.get("model", "")
-
-        choices = body.get("choices", [])
-        if choices:
-            choice = choices[0]
-            finish_reason = choice.get("finish_reason", "")
+        for choice in body.get("choices", []):
             message = choice.get("message", {})
-
-            # Extract text content
-            msg_content = message.get("content", "")
-            if isinstance(msg_content, str):
-                content_parts.append(msg_content)
-            elif isinstance(msg_content, list):
-                for part in msg_content:
-                    if isinstance(part, dict):
-                        if part.get("type") == "text":
-                            content_parts.append(part.get("text", ""))
-                        elif part.get("type") == "thinking":
-                            reasoning += part.get("thinking", "")
-
-            # Extract reasoning/thinking content (Anthropic-style)
-            if message.get("thinking"):
-                reasoning += message.get("thinking", "")
-
-            # Extract tool calls
-            for tc in message.get("tool_calls", []):
-                func = tc.get("function", {})
-                args: dict[str, Any] = {}
-                if isinstance(func.get("arguments"), str):
-                    import json
-
-                    try:
-                        args = json.loads(func["arguments"])
-                    except (json.JSONDecodeError, TypeError):
-                        args = {}
-                elif isinstance(func.get("arguments"), dict):
-                    args = func["arguments"]
-
-                tool_calls.append(
-                    ParsedToolCall(
-                        tool_name=func.get("name", ""),
-                        tool_args=args,
-                        call_id=tc.get("id", ""),
-                    )
+            finish_reason = choice.get("finish_reason") or finish_reason
+            text = _extract_content_text(message.get("content"))
+            if text:
+                contents.append(text)
+            for key in ("thinking", "reasoning_content", "reasoning"):
+                if isinstance(message.get(key), str):
+                    reasoning.append(message[key])
+            if isinstance(message.get("content"), list):
+                reasoning.extend(
+                    part.get("thinking", "")
+                    for part in message["content"]
+                    if isinstance(part, dict) and part.get("type") == "thinking"
                 )
-
+            calls.extend(_chat_tool_call(tc) for tc in message.get("tool_calls", []))
+            if message.get("function_call"):
+                calls.append(_chat_tool_call({"function": message["function_call"]}))
         return ParsedResponse(
-            content="\n".join(content_parts),
-            tool_calls=tool_calls,
-            reasoning=reasoning,
+            content="\n".join(contents),
+            tool_calls=calls,
+            reasoning="\n".join(reasoning),
             finish_reason=finish_reason,
-            model=model,
+            model=body.get("model", ""),
             raw_body=body,
         )
 
     def parse_anthropic(self, body: dict[str, Any]) -> ParsedResponse:
-        """Parse an Anthropic /v1/messages response body."""
-        content_parts: list[str] = []
-        tool_calls: list[ParsedToolCall] = []
-        reasoning_parts: list[str] = []
-
+        contents, calls, reasoning = [], [], []
         for block in body.get("content", []):
             if not isinstance(block, dict):
                 continue
-            block_type = block.get("type")
-            if block_type == "text":
-                text = block.get("text", "")
-                if isinstance(text, str) and text:
-                    content_parts.append(text)
-            elif block_type == "tool_use":
-                tool_calls.append(
+            kind = block.get("type")
+            if kind == "text":
+                contents.append(str(block.get("text") or ""))
+            elif kind == "thinking":
+                reasoning.append(str(block.get("thinking") or ""))
+            elif kind == "tool_use":
+                args, valid = parse_tool_arguments(block.get("input"))
+                calls.append(
                     ParsedToolCall(
                         tool_name=str(block.get("name") or ""),
-                        tool_args=block.get("input") if isinstance(block.get("input"), dict) else {},
+                        tool_args=args,
                         call_id=str(block.get("id") or ""),
+                        arguments_valid=valid,
                     )
                 )
-            elif block_type == "thinking":
-                thinking = block.get("thinking", "")
-                if isinstance(thinking, str) and thinking:
-                    reasoning_parts.append(thinking)
-
         return ParsedResponse(
-            content="\n".join(content_parts),
-            tool_calls=tool_calls,
-            reasoning="\n".join(reasoning_parts),
+            content="\n".join(contents),
+            tool_calls=calls,
+            reasoning="\n".join(reasoning),
             finish_reason=str(body.get("stop_reason") or ""),
             model=str(body.get("model") or ""),
             raw_body=body,
         )
 
-    def parse_stream_chunk(self, chunk: dict[str, Any]) -> ParsedResponse:
-        """Parse a single SSE streaming chunk.
-
-        Returns a partial ParsedResponse with whatever content is available
-        in this chunk. Tool calls are accumulated incrementally.
-        """
-        content_parts: list[str] = []
-        tool_calls: list[ParsedToolCall] = []
-        reasoning = ""
-        finish_reason = ""
-
-        choices = chunk.get("choices", [])
-        if choices:
-            delta = choices[0].get("delta", {})
-            finish_reason = choices[0].get("finish_reason", "") or ""
-
-            # Text content
-            if isinstance(delta.get("content"), str):
-                content_parts.append(delta["content"])
-
-            # Reasoning/thinking
-            if delta.get("reasoning_content"):
-                reasoning = delta["reasoning_content"]
-            if delta.get("thinking"):
-                reasoning = delta["thinking"]
-
-            # Tool calls (incremental)
-            for tc in delta.get("tool_calls", []):
-                func = tc.get("function", {})
-                args: dict[str, Any] = {}
-                if isinstance(func.get("arguments"), str):
-                    import json
-
-                    try:
-                        args = json.loads(func["arguments"])
-                    except (json.JSONDecodeError, TypeError):
-                        # Partial JSON in streaming — treat as raw string
-                        args = {"_raw_arguments": func["arguments"]}
-
-                tool_calls.append(
-                    ParsedToolCall(
-                        tool_name=func.get("name", ""),
-                        tool_args=args,
-                        call_id=tc.get("id", ""),
-                    )
-                )
-
+    def parse_responses(self, body: dict[str, Any]) -> ParsedResponse:
+        contents, calls, reasoning = [], [], []
+        for item in body.get("output", []):
+            if not isinstance(item, dict):
+                continue
+            if call := responses_tool_call(item):
+                calls.append(call)
+            elif item.get("type") == "message":
+                contents.append(_extract_content_text(item.get("content")))
+            elif item.get("type") == "reasoning":
+                reasoning.append(_extract_content_text(item.get("summary")))
         return ParsedResponse(
-            content="\n".join(content_parts),
-            tool_calls=tool_calls,
-            reasoning=reasoning,
-            finish_reason=finish_reason,
-            model=chunk.get("model", ""),
-            raw_body=chunk,
+            content="\n".join(part for part in contents if part),
+            tool_calls=calls,
+            reasoning="\n".join(reasoning),
+            finish_reason=str(body.get("status") or ""),
+            model=str(body.get("model") or ""),
+            raw_body=body,
         )
+
+    def parse_stream_chunk(self, chunk: dict[str, Any]) -> ParsedResponse:
+        # Deltas are partial; the stream handler validates final arguments.
+        response = self.parse(
+            {
+                **chunk,
+                "choices": [{**choice, "message": choice.get("delta", {})} for choice in chunk.get("choices", [])],
+            }
+        )
+        response.raw_body = chunk
+        return response

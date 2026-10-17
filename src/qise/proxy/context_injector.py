@@ -107,6 +107,22 @@ class ContextInjector:
             ]
         return new_body
 
+    def inject_responses(self, body: dict[str, Any], tool_names: list[str] | None = None) -> dict[str, Any]:
+        """Responses uses a top-level instructions field and flat tool definitions."""
+        names = (
+            tool_names
+            if tool_names is not None
+            else [tool.get("name", "") for tool in body.get("tools", []) if tool.get("type") in {"function", "custom"}]
+        )
+        parts = [self._provider.render_for_agent(name) for name in dict.fromkeys(names) if name]
+        injection = "\n\n".join(part for part in parts if part)
+        if not injection:
+            return body
+        new_body = copy.deepcopy(body)
+        instructions = new_body.get("instructions") or ""
+        new_body["instructions"] = instructions + "\n\n" + injection if instructions else injection
+        return new_body
+
     def _inject_into_messages(self, messages: list[dict[str, Any]], injection: str) -> None:
         """Inject security context text into the message list.
 

@@ -8,14 +8,15 @@ Coordinates request and response interception:
 
 from __future__ import annotations
 
+import copy
 from contextlib import suppress
 from typing import Any
 
 from pydantic import BaseModel, Field
 
-from qise.core.models import GuardContext, PipelineResult
+from qise.core.models import GuardContext, PipelineResult, ToolCallRecord
 from qise.product.events import record_guard_event
-from qise.proxy.parser import ParsedRequest, ParsedResponse
+from qise.proxy.parser import ParsedMessage, ParsedRequest, ParsedResponse
 
 
 class ProxyDecision(BaseModel):
@@ -71,15 +72,18 @@ class ProxyInterceptor:
         Returns:
             ProxyDecision with action pass/warn/block.
         """
+        from qise.product.policy import refresh_guard_policy
+
+        refresh_guard_policy(self._shield)
         all_warnings: list[str] = []
         all_results: list[dict[str, Any]] = []
         should_block = False
         block_reason = ""
+        modified_body = copy.deepcopy(raw_body)
+        request_context = self._request_context(parsed, agent_name)
 
-        guard_modes = {
-            name: self._shield.config.guard_mode(name)
-            for name in self._shield.config.guards.enabled
-        }
+        config = self._shield.config
+        guard_modes = {name: config.guard_mode(name) for name in config.guards.enabled}
 
         # Check user messages and tool results for injection
         for msg in parsed.messages:
@@ -90,10 +94,15 @@ class ProxyInterceptor:
                     tool_args={"content": msg.content},
                     trust_boundary=trust_boundary,
                     integration_mode="proxy",
+                    **request_context,
                 )
                 result = self._shield.pipeline.run_ingress(ctx, guard_modes)
                 all_results.extend(self._summarize_results(result))
                 all_warnings.extend(result.warnings)
+                if result.transformed_args:
+                    transformed = result.transformed_args.get("content")
+                    if isinstance(transformed, str) and transformed != msg.content:
+                        self._replace_message_content(modified_body, msg, transformed)
 
                 if result.should_block:
                     should_block = True
@@ -110,6 +119,7 @@ class ProxyInterceptor:
                         tool_description=tool_def.description,
                         trust_boundary="tool_description",
                         integration_mode="proxy",
+                        **request_context,
                     )
                     result = self._shield.pipeline.run_ingress(ctx, guard_modes)
                     all_results.extend(self._summarize_results(result))
@@ -130,7 +140,7 @@ class ProxyInterceptor:
 
         decision = ProxyDecision(
             action=action,
-            modified_body=raw_body,
+            modified_body=modified_body,
             warnings=all_warnings,
             block_reason=block_reason,
             guard_results=all_results,
@@ -150,6 +160,8 @@ class ProxyInterceptor:
         parsed: ParsedResponse,
         raw_body: dict[str, Any],
         agent_name: str = "",
+        request_context: ParsedRequest | None = None,
+        audit_only: bool = False,
     ) -> ProxyDecision:
         """Intercept a chat completion response.
 
@@ -161,23 +173,31 @@ class ProxyInterceptor:
         Returns:
             ProxyDecision with action pass/warn/block.
         """
+        from qise.product.policy import refresh_guard_policy
+
+        refresh_guard_policy(self._shield)
         all_warnings: list[str] = []
         all_results: list[dict[str, Any]] = []
         should_block = False
         block_reason = ""
+        context_fields = self._request_context(request_context, agent_name) if request_context else {}
 
-        guard_modes = {
-            name: self._shield.config.guard_mode(name)
-            for name in self._shield.config.guards.enabled
-        }
+        config = self._shield.config
+        guard_modes = {name: config.guard_mode(name) for name in config.guards.enabled}
 
         # Check tool calls for dangerous actions (egress)
         for tc in parsed.tool_calls:
+            if not tc.arguments_valid or not tc.tool_name:
+                should_block = True
+                block_reason = "Tool call has incomplete or invalid arguments"
+                break
             ctx = GuardContext(
                 tool_name=tc.tool_name,
                 tool_args=tc.tool_args,
                 integration_mode="proxy",
                 agent_reasoning=parsed.reasoning or None,
+                active_security_rules=self._security_rules(tc.tool_name, tc.tool_args),
+                **context_fields,
             )
             result = self._shield.pipeline.run_egress(ctx, guard_modes)
             all_results.extend(self._summarize_results(result))
@@ -189,11 +209,13 @@ class ProxyInterceptor:
                 break
 
         # Check response text for credential/PII leaks (output)
-        if not should_block and parsed.content:
+        if not should_block and (parsed.content or parsed.reasoning):
             ctx = GuardContext(
                 tool_name="output",
                 tool_args={"text": parsed.content},
                 integration_mode="proxy",
+                agent_reasoning=parsed.reasoning or None,
+                **context_fields,
             )
             result = self._shield.pipeline.run_output(ctx, guard_modes)
             all_results.extend(self._summarize_results(result))
@@ -204,7 +226,10 @@ class ProxyInterceptor:
                 block_reason = f"Output blocked by guard: {result.blocked_by}"
 
         # Determine action
-        if should_block:
+        if should_block and audit_only:
+            all_warnings.append("Output audit detected risk after text was delivered; delivery was not blocked")
+            action = "warn"
+        elif should_block:
             action = "block"
         elif all_warnings:
             action = "warn"
@@ -227,6 +252,56 @@ class ProxyInterceptor:
             agent_name=agent_name,
         )
         return decision
+
+    def _security_rules(self, tool_name: str, tool_args: dict[str, Any]) -> list[str]:
+        context = self._shield.get_security_context(tool_name, tool_args)
+        return [line for line in context.splitlines() if line.strip()] if context else []
+
+    def _request_context(self, parsed: ParsedRequest, agent_name: str) -> dict[str, Any]:
+        """Use only history actually supplied in this request; do not invent hidden state."""
+        history = [
+            ToolCallRecord(tool_name=call.tool_name, tool_args=call.tool_args)
+            for message in parsed.messages
+            for call in message.tool_calls
+        ]
+        trajectory = [
+            {"role": message.role, "content": message.content[:4000]}
+            for message in parsed.messages[-20:]
+            if message.content
+        ]
+        metadata = parsed.raw_body.get("metadata") or {}
+        session_id = metadata.get("session_id") if isinstance(metadata, dict) else None
+        return {
+            "session_trajectory": trajectory,
+            "tool_call_history": history[-20:],
+            "iteration_count": len(history),
+            "session_id": f"{agent_name}:{session_id}" if isinstance(session_id, str) else None,
+            "framework_metadata": {
+                "agent_name": agent_name,
+                "api_format": parsed.api_format,
+                "history_scope": "request_only",
+                "previous_response_id": parsed.raw_body.get("previous_response_id"),
+            },
+        }
+
+    @staticmethod
+    def _replace_message_content(body: dict[str, Any], message: ParsedMessage, transformed: str) -> None:
+        """Replace inspected text only, retaining image/file blocks and protocol fields."""
+        if message.content and transformed.endswith(message.content) and message.content_paths:
+            # Isolation adds a prefix. Preserve all original block positions, so
+            # text surrounding an image or file keeps its original meaning.
+            prefix = transformed[: -len(message.content)]
+            parent: Any = body
+            path = message.content_paths[0]
+            for component in path[:-1]:
+                parent = parent[component]
+            parent[path[-1]] = prefix + parent[path[-1]]
+            return
+        for index, path in enumerate(message.content_paths):
+            parent: Any = body
+            for component in path[:-1]:
+                parent = parent[component]
+            parent[path[-1]] = transformed if index == 0 else ""
 
     def _record_decision_event(
         self,
@@ -286,6 +361,7 @@ class ProxyInterceptor:
                 "verdict": gr.verdict,
                 "confidence": gr.confidence,
                 "message": gr.message,
+                "evidence_kind": gr.evidence_kind,
             }
             if gr.risk_attribution:
                 summary["risk_source"] = gr.risk_attribution.risk_source

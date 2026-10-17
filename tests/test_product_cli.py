@@ -355,7 +355,7 @@ env_key = "OPENAI_API_KEY"
 
     status = _run(["status"], tmp_path, env)
     assert status.returncode == 0
-    assert "Codex: installed, protected" in status.stdout
+    assert "Codex: installed, configured, needs attention" in status.stdout
     assert "backup:" in status.stdout
 
     restored = _run(["restore", "codex"], tmp_path, env)

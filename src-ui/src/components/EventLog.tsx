@@ -18,6 +18,8 @@ function verdictBadgeClass(verdict: string): string {
       return "badge-block";
     case "warn":
       return "badge-warn";
+    case "info":
+      return "badge-info";
     case "pass":
       return "badge-pass";
     default:
