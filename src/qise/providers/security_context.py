@@ -13,8 +13,9 @@ import fnmatch
 from pathlib import Path
 from typing import Any
 
-import yaml
 from pydantic import BaseModel, Field
+
+from qise.data.yaml_loader import load_yaml_file, yaml_files
 
 # ---------------------------------------------------------------------------
 # DSL data models
@@ -73,13 +74,9 @@ class SecurityContextProvider:
 
     def load_templates(self, templates_dir: Path) -> None:
         """Load all YAML templates from a directory."""
-        if not templates_dir.exists():
-            return
-
-        for yaml_file in sorted(templates_dir.glob("*.yaml")):
+        for yaml_file in yaml_files(templates_dir):
             try:
-                with open(yaml_file) as f:
-                    raw = yaml.safe_load(f)
+                raw = load_yaml_file(yaml_file)
                 if raw and isinstance(raw, dict):
                     self._templates.append(SecurityContextTemplate(**raw))
             except Exception:

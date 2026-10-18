@@ -6,14 +6,15 @@ ThreatPatternLoader, BaselineManager, and all enabled Guards.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from qise.core.config import ShieldConfig
 from qise.core.event_logger import EventLogger
 from qise.core.guard_base import AIGuardBase
 from qise.core.metrics import GuardMetrics
-from qise.core.models import GuardContext, PipelineResult
+from qise.core.models import GuardContext, PipelineResult, ToolCallRecord
 from qise.core.pipeline import GuardPipeline
 from qise.core.session_tracker import SessionTracker
 from qise.data.baseline_manager import BaselineManager
@@ -125,22 +126,66 @@ class Shield:
 
     async def check(self, context: GuardContext) -> PipelineResult:
         """Run applicable guard pipelines and return aggregate result."""
+        return self.check_sync(context)
+
+    def check_sync(
+        self,
+        context: GuardContext,
+        *,
+        pipeline_kind: Literal["ingress", "egress", "output"] | None = None,
+    ) -> PipelineResult:
+        """Check with configured modes and shared session/security context.
+
+        Synchronous integrations use this entry point rather than bypassing
+        mode handling through a raw pipeline. Returned transformations apply
+        to the checked content; callers must stop on ``should_block`` first.
+        """
+        config = self.config
         guard_modes = {
-            name: self.config.guard_mode(name)
-            for name in self.config.guards.enabled
+            name: config.guard_mode(name)
+            for name in config.guards.enabled
         }
 
-        # Determine which pipelines to run based on context
-        if context.tool_name in ("output", "output_check", "content_check") and context.trust_boundary is None:
-            # Output check: credential leaks, PII, KB content
-            return self.pipeline.run_output(context, guard_modes)
+        updates: dict[str, Any] = {}
+        if not context.active_security_rules:
+            rules = self.context_provider.render_for_agent(
+                context.tool_name, context.tool_args, trust_boundary=context.trust_boundary,
+            )
+            updates["active_security_rules"] = [line for line in rules.splitlines() if line.strip()]
+        if context.session_id and not context.tool_call_history:
+            updates["tool_call_history"] = self.session_tracker.get_tool_call_history(
+                context.session_id,
+            )
+        context = context.model_copy(update=updates)
 
-        if context.trust_boundary is not None:
-            # Ingress: external data entering agent context
-            return self.pipeline.run_ingress(context, guard_modes)
+        if pipeline_kind is None:
+            if context.trust_boundary is not None:
+                pipeline_kind = "ingress"
+            elif context.tool_name in ("output", "output_check", "content_check"):
+                pipeline_kind = "output"
+            else:
+                pipeline_kind = "egress"
+        runner = {
+            "ingress": self.pipeline.run_ingress,
+            "egress": self.pipeline.run_egress,
+            "output": self.pipeline.run_output,
+        }[pipeline_kind]
+        result = runner(context, guard_modes)
 
-        # Egress: agent action going to external world
-        return self.pipeline.run_egress(context, guard_modes)
+        if context.session_id:
+            for guard_result in result.results:
+                self.session_tracker.record_guard_result(context.session_id, guard_result)
+            if pipeline_kind == "egress":
+                self.session_tracker.record_tool_call(
+                    context.session_id,
+                    ToolCallRecord(
+                        tool_name=context.tool_name,
+                        tool_args=context.tool_args,
+                        verdict=result.verdict,
+                        timestamp=time.time(),
+                    ),
+                )
+        return result
 
     async def check_tool_call(
         self,
@@ -154,11 +199,7 @@ class Shield:
             tool_args=tool_args,
             **kwargs,
         )
-        guard_modes = {
-            name: self.config.guard_mode(name)
-            for name in self.config.guards.enabled
-        }
-        return self.pipeline.run_egress(context, guard_modes)
+        return self.check_sync(context, pipeline_kind="egress")
 
     def get_security_context(
         self,
@@ -193,6 +234,7 @@ class Shield:
 
         # Rebuild guards and pipeline
         self.pipeline = self._build_guards()
+        self.pipeline.set_metrics(self.metrics)
 
         # Wire model router and metrics into all guards
         for guard in self.pipeline.all_guards:
@@ -262,9 +304,8 @@ class Shield:
         pipeline = GuardPipeline()
 
         for guard_name in self.config.guards.enabled:
-            if not self.config.is_guard_enabled(guard_name):
-                continue
-
+            # Keep configured guards available so changing off → enforce does
+            # not require rebuilding the Shield. Pipeline execution skips off.
             guard = self._create_guard(guard_name)
             if guard is None:
                 continue
@@ -286,6 +327,7 @@ class Shield:
                 # Default: egress for unknown guards
                 pipeline.egress.add_guard(guard)
 
+        pipeline.egress.guards.sort(key=lambda guard: guard.name != "reasoning")
         return pipeline
 
     def _create_guard(self, guard_name: str) -> AIGuardBase | None:

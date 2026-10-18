@@ -188,6 +188,13 @@ class GuardResult(BaseModel):
     confidence: float = 1.0
     message: str = ""
     remediation: str = ""
+    evidence_kind: Literal["finding", "precaution", "degraded"] = Field(
+        default="finding",
+        description=(
+            "finding: concrete risk or policy decision; precaution: source isolation only; "
+            "degraded: security analysis unavailable. Informational only; never overrides verdict."
+        ),
+    )
     risk_attribution: RiskAttribution | None = None
     transformed_args: dict[str, Any] | None = Field(
         default=None,
@@ -202,8 +209,8 @@ class GuardResult(BaseModel):
 
     @property
     def should_block(self) -> bool:
-        """Convenience: True if this result blocks the action."""
-        return self.verdict == GuardVerdict.BLOCK
+        """True when execution must stop, including pending human approval."""
+        return self.verdict in (GuardVerdict.BLOCK, GuardVerdict.APPROVE)
 
 
 class PipelineResult(BaseModel):
@@ -214,10 +221,14 @@ class PipelineResult(BaseModel):
     blocked_by: str | None = None
     warnings: list[str] = Field(default_factory=list)
     threshold_adjustments: dict[str, float] = Field(default_factory=dict)
+    transformed_args: dict[str, Any] | None = Field(
+        default=None,
+        description="Final checked arguments after sequential guard transformations",
+    )
 
     @property
     def should_block(self) -> bool:
-        return self.verdict == GuardVerdict.BLOCK
+        return self.verdict in (GuardVerdict.BLOCK, GuardVerdict.APPROVE)
 
 
 # ---------------------------------------------------------------------------

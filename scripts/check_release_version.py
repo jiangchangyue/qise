@@ -27,6 +27,13 @@ def _read_json(path: str) -> dict[str, object]:
 def release_versions() -> dict[str, str]:
     pyproject = _read_toml("pyproject.toml")
     cargo = _read_toml("src-tauri/Cargo.toml")
+    cargo_lock = _read_toml("src-tauri/Cargo.lock")
+    locked_app = next(
+        (package for package in cargo_lock.get("package", []) if package.get("name") == "qise-app"),
+        None,
+    )
+    if locked_app is None:
+        raise ValueError("src-tauri/Cargo.lock does not define qise-app")
     tauri = _read_json("src-tauri/tauri.conf.json")
     package = _read_json("src-ui/package.json")
     package_lock = _read_json("src-ui/package-lock.json")
@@ -43,6 +50,7 @@ def release_versions() -> dict[str, str]:
         "pyproject.toml": str(pyproject["project"]["version"]),  # type: ignore[index]
         "src/qise/__init__.py": init_match.group(1),
         "src-tauri/Cargo.toml": str(cargo["package"]["version"]),  # type: ignore[index]
+        "src-tauri/Cargo.lock qise-app": str(locked_app["version"]),
         "src-tauri/tauri.conf.json": str(tauri["version"]),
         "src-ui/package.json": str(package["version"]),
         "src-ui/package-lock.json": str(package_lock["version"]),

@@ -22,7 +22,9 @@ Qise currently checks these paths:
 ~/.claw/config.json
 ```
 
-It rewrites base-url-like fields to `http://127.0.0.1:8822/agent/openclaw/v1`. Qise metadata is stored in `~/.qise/state.json`, not in the OpenClaw config, because OpenClaw rejects unknown root keys.
+For modern layouts, Qise reads `agents.defaults.model.primary` and rewrites only that provider's `models.providers.<name>.baseUrl` to `http://127.0.0.1:8822/agent/openclaw/v1`. Other providers remain unchanged. It accepts supported OpenAI or Anthropic HTTP protocols; legacy configs with one unambiguous endpoint are also supported. Ambiguous configurations are left unchanged. This follows the [OpenClaw custom provider schema](https://docs.openclaw.ai/gateway/config-tools/custom-providers).
+
+Qise metadata is stored in `~/.qise/state.json`, not added to the OpenClaw config. Switching providers, using fallback models, or overriding endpoints may bypass this selected route; check status after such changes. Full JSON5 syntax is not supported by this config editor.
 
 ## Validation
 

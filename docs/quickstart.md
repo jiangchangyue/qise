@@ -1,6 +1,6 @@
 # Quickstart
 
-This quickstart gives you a local Qise MVP loop: diagnose, scan, block a dangerous tool call, view events, and optionally protect Codex.
+Start with a safety check. Smart Protection can then connect a supported agent to Qise's local HTTP proxy. No SLM, Ollama installation, model download, or GPU is required for this flow.
 
 ## Install
 
@@ -12,71 +12,87 @@ source .venv/bin/activate
 pip install -e ".[proxy]"
 ```
 
-## Run the Safe Demo
+On Windows, activate with `.venv\Scripts\Activate.ps1` in PowerShell. See [Install](install.md) for desktop packages and optional dependencies.
+
+## Check Before Connecting
+
+```bash
+qise doctor
+qise agents --json
+qise scan all
+qise guards --json
+qise events --limit 10
+```
+
+The desktop homepage's **Safety Check** runs the same asset scan. A scan inspects supported local assets; it does not prove that an agent's model traffic is routed through Qise.
+
+To try a disposable demo on macOS/Linux:
 
 ```bash
 bash ./scripts/demo_mvp.sh
 ```
 
-The script uses temporary `QISE_HOME` and `QISE_AGENT_HOME` directories, so it does not touch your real `~/.codex` config.
+The demo uses temporary `QISE_HOME` and `QISE_AGENT_HOME` directories instead of your real agent configuration.
 
-## Manual MVP Loop
+## Connect a Supported Agent
 
-```bash
-qise doctor
-qise status
-qise scan skill examples/skills/safe
-qise scan skill examples/skills/dangerous || true
-qise scan mcp examples/mcp-dangerous.json || true
-qise check bash '{"command":"rm -rf /"}' || true
-qise events --limit 10
-qise events --limit 10 --json
-```
-
-## Enable Local SLM
-
-Qise works in rule-only mode by default. To enable the second-layer local 4B SLM:
-
-```bash
-qise slm start
-qise slm status
-```
-
-Advanced options:
-
-```bash
-qise slm start --model llama3.2:3b
-qise slm start --base-url http://localhost:8000/v1 --model my-security-model
-qise slm stop --keep-server
-```
-
-Disable the SLM layer:
-
-```bash
-qise slm stop
-```
-
-Restart Qise protection after changing SLM state if the proxy was already running.
-
-## Protect Codex
-
-If Codex is installed and has a config, run:
+Choose the agent you actually use:
 
 ```bash
 qise protect codex
-qise status
+# Alternatives: qise protect opencode / openclaw / claude-code
+qise status --json
+```
+
+Qise backs up the selected config before changing its endpoint. OpenCode and OpenClaw use the selected model provider; other providers are left alone. If the upstream cannot be inferred, supply the model API the agent normally uses:
+
+```bash
+qise protect opencode --base-url https://api.example.com/v1
+```
+
+Check the returned agent status. `configured` means a Qise connection can be restored. `protected` requires the managed services to be healthy and the selected config route to match. A running proxy by itself is not proof of protection; project config overrides or a different client transport may still bypass it.
+
+WorkBuddy supports scans and manual connection, not automatic takeover:
+
+```bash
+qise scan agent workbuddy
+qise protect custom --base-url https://api.example.com/v1
+```
+
+For manual connection, set the agent's supported HTTP API base URL to the local URL printed by Qise. Qise does not automatically verify this manual route. See [protocol coverage](integration.md#http-protocol-coverage).
+
+## Review Rules and Events
+
+Smart Protection uses `enforce` for default command, filesystem, network, credential, and tool-policy rules. Other guards default to `observe`; a warning is not a block. Change a guard only after reviewing its behavior:
+
+```bash
+qise guards --json
+qise guards --set prompt observe --json
+qise events --limit 10 --json
+```
+
+Mode changes are saved locally and read by product proxy/Bridge checks without restarting. `info` events describe precautionary guidance or degraded detection; `warn` and `block` report findings.
+
+## Restore Before Stopping
+
+```bash
 qise restore codex
+# Or: qise restore all
 qise stop
 ```
 
-`qise protect codex` backs up your config under `~/.qise/backups/codex/...` before patching it.
+`qise stop` also restores all configured agents before stopping managed services. If a restore fails, it keeps the services running to avoid breaking the remaining connection. Restore removes Qise's changes while preserving unrelated edits where possible. A conflicting change is reported without overwriting it; the backup remains available.
 
-## When `protect` Needs `--base-url`
+## Optional Enhanced Detection
 
-Qise first tries to infer the upstream model API from the Agent config. If inference fails, pass the model API your Agent normally uses:
+Only enable a model if you want semantic review:
 
 ```bash
-qise protect codex --base-url https://api.openai.com/v1
+qise slm start --base-url http://localhost:8000/v1 --model my-security-model
+qise slm status
+qise slm stop
 ```
 
-For non-OpenAI providers, use that provider's OpenAI-compatible base URL.
+An explicit `qise slm start` with no options selects Ollama and `qwen3:4b`, and may install Ollama or download the model. After changing a model endpoint while services are running, restore agent connections, stop services, and connect again. Model review does not automatically change guard modes.
+
+See [protection behavior and upgrade notes](protection-upgrade.md) for status, recovery, protocol, and evaluation boundaries.

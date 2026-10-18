@@ -49,6 +49,7 @@ class RuleChecker(ABC):
             verdict=GuardVerdict.WARN,
             confidence=0.5,
             message="Security models unavailable, applying safe defaults",
+            evidence_kind="degraded",
         )
 
 
@@ -121,11 +122,12 @@ class AIGuardBase:
         """Internal implementation of three-layer decision flow."""
         start = time.monotonic()
         # Layer 0: Deterministic rule fast-path (0ms overhead)
+        rule_result: GuardResult | None = None
         rule_warn: GuardResult | None = None
         if self.rule_fallback is not None:
             rule_result = self.rule_fallback.check(context)
-            # Rule BLOCK always short-circuits (definitive block)
-            if rule_result.verdict == GuardVerdict.BLOCK:
+            # A model must never waive a denial or required human approval.
+            if rule_result.verdict in (GuardVerdict.BLOCK, GuardVerdict.APPROVE):
                 rule_result.latency_ms = _elapsed_ms(start)
                 return rule_result
             # For rule-only guards, rule PASS always short-circuits
@@ -144,10 +146,9 @@ class AIGuardBase:
 
         # For rule-only guards, stop here after rule fast-path
         if self.primary_strategy == "rules":
-            if self.rule_fallback is not None:
-                result = self.rule_fallback.check_safe_default(context)
-                result.latency_ms = _elapsed_ms(start)
-                return result
+            if rule_result is not None:
+                rule_result.latency_ms = _elapsed_ms(start)
+                return rule_result
             return GuardResult(
                 guard_name=self.name,
                 verdict=GuardVerdict.PASS,
@@ -161,17 +162,7 @@ class AIGuardBase:
                 slm_result.confidence >= self.slm_confidence_threshold
                 and slm_result.verdict != GuardVerdict.ESCALATE
             ):
-                slm_result.latency_ms = _elapsed_ms(start)
-                # SLM cannot downgrade a high-confidence rule WARN to PASS.
-                # Low-confidence rule WARNs (trust boundary isolation, < 0.65)
-                # can be overridden since SLM provides actual content analysis.
-                if (
-                    rule_warn is not None
-                    and slm_result.verdict == GuardVerdict.PASS
-                    and rule_warn.confidence >= self.slm_override_rule_warn_threshold
-                ):
-                    return rule_warn
-                return slm_result
+                return self._combine_model_result(slm_result, rule_warn, start)
             # ESCALATE → fall through to LLM
         except ModelUnavailableError:
             pass  # Degrade to LLM or rule fallback
@@ -180,31 +171,63 @@ class AIGuardBase:
         if self.llm_prompt_template:
             try:
                 llm_result = self._llm_check(context)
-                llm_result.latency_ms = _elapsed_ms(start)
-                return llm_result
+                return self._combine_model_result(llm_result, rule_warn, start)
             except ModelUnavailableError:
                 pass  # Fall through to rule fallback
 
         # Layer 3: Rule fallback (never fail-open)
-        # Re-run rule check — if rules can give a definitive answer, use it.
-        # Only fall to check_safe_default() when rules are also uncertain.
-        if self.rule_fallback is not None:
-            rule_result = self.rule_fallback.check(context)
-            if rule_result.verdict in (GuardVerdict.BLOCK, GuardVerdict.PASS):
+        # Preserve the original finding. Re-running a stateful rule may change
+        # its answer (for example, after recording a first-seen hash baseline).
+        if rule_result is not None:
+            if rule_result.verdict != GuardVerdict.ESCALATE:
                 rule_result.latency_ms = _elapsed_ms(start)
                 return rule_result
-            # Rules are uncertain → conservative WARN
-            result = self.rule_fallback.check_safe_default(context)
-            result.latency_ms = _elapsed_ms(start)
-            return result
+            # An unresolved finding remains visible even without a model.
+            return rule_result.model_copy(update={
+                "verdict": GuardVerdict.WARN,
+                "message": f"{rule_result.message}; security models unavailable for further analysis",
+                "latency_ms": _elapsed_ms(start),
+            })
 
         return GuardResult(
             guard_name=self.name,
             verdict=GuardVerdict.WARN,
             confidence=0.5,
             message="Security models unavailable, applying safe defaults",
+            evidence_kind="degraded",
             latency_ms=_elapsed_ms(start),
         )
+
+    def _combine_model_result(
+        self, result: GuardResult, rule_warn: GuardResult | None, start: float,
+    ) -> GuardResult:
+        """Apply the same rule precedence to both model stages."""
+        if rule_warn is not None:
+            if (
+                (
+                    result.verdict == GuardVerdict.PASS
+                    and rule_warn.confidence >= self.slm_override_rule_warn_threshold
+                )
+                or (rule_warn.evidence_kind == "finding" and result.evidence_kind != "finding")
+            ):
+                attribution = rule_warn.risk_attribution or RiskAttribution(
+                    risk_source=self.name,
+                    failure_mode="rule_finding",
+                    real_world_harm="unknown",
+                    confidence=rule_warn.confidence,
+                    reasoning=f"{rule_warn.message}. Model assessment: {result.message}",
+                )
+                return rule_warn.model_copy(update={
+                    "latency_ms": _elapsed_ms(start),
+                    "model_used": result.model_used,
+                    "risk_attribution": attribution,
+                })
+            # Isolation or sanitization remains available to callers even when
+            # a model clears a precautionary source-trust warning.
+            if result.transformed_args is None:
+                result.transformed_args = rule_warn.transformed_args
+        result.latency_ms = _elapsed_ms(start)
+        return result
 
     def _slm_check(self, context: GuardContext) -> GuardResult:
         """SLM fast-screen stub.
@@ -336,10 +359,21 @@ class AIGuardBase:
                 verdict=GuardVerdict.WARN,
                 confidence=0.3,
                 message=f"Unexpected model response type: {type(response)}",
+                evidence_kind="degraded",
                 model_used=model_tag,
+                risk_attribution=RiskAttribution(
+                    risk_source="unknown",
+                    failure_mode="invalid_model_response",
+                    real_world_harm="unknown",
+                    confidence=0.3,
+                    reasoning="Security model did not return a structured assessment",
+                ),
             )
 
-        raw_verdict = response.get("verdict", "safe")
+        raw_verdict = response.get("verdict", "suspicious")
+        has_valid_verdict = "verdict" in response and isinstance(raw_verdict, str)
+        if not isinstance(raw_verdict, str):
+            raw_verdict = "suspicious"
 
         # Normalize common verdict synonyms
         verdict_synonyms: dict[str, str] = {
@@ -355,7 +389,8 @@ class AIGuardBase:
             "concerned": "suspicious",
             "alarmed": "malicious",
         }
-        normalized = verdict_synonyms.get(raw_verdict.lower(), raw_verdict.lower())
+        normalized = raw_verdict.strip().lower()
+        normalized = verdict_synonyms.get(normalized, normalized)
 
         verdict_map = {
             "safe": GuardVerdict.PASS,
@@ -373,18 +408,21 @@ class AIGuardBase:
         except (ValueError, TypeError):
             confidence = 0.5
 
-        reasoning = response.get("reasoning", "")
+        reasoning = str(response.get("reasoning") or "")
 
-        risk_attribution: RiskAttribution | None = None
         ra_data = response.get("risk_attribution")
-        if isinstance(ra_data, dict):
-            risk_attribution = RiskAttribution(
-                risk_source=ra_data.get("risk_source", response.get("risk_source", "unknown")),
-                failure_mode=ra_data.get("failure_mode", "unknown"),
-                real_world_harm=ra_data.get("real_world_harm", "unknown"),
-                confidence=ra_data.get("confidence", confidence),
-                reasoning=ra_data.get("reasoning", reasoning),
-            )
+        attribution = ra_data if isinstance(ra_data, dict) else response
+        try:
+            attribution_confidence = max(0.0, min(1.0, float(attribution.get("confidence", confidence))))
+        except (ValueError, TypeError):
+            attribution_confidence = confidence
+        risk_attribution = RiskAttribution(
+            risk_source=str(attribution.get("risk_source", response.get("risk_source", "unknown"))),
+            failure_mode=str(attribution.get("failure_mode", "unknown")),
+            real_world_harm=str(attribution.get("real_world_harm", "unknown")),
+            confidence=attribution_confidence,
+            reasoning=str(attribution.get("reasoning", reasoning)),
+        )
 
         message = reasoning or f"Model ({model_tag}) assessed as {raw_verdict}"
 
@@ -395,6 +433,9 @@ class AIGuardBase:
             message=message,
             risk_attribution=risk_attribution,
             model_used=model_tag,
+            evidence_kind=(
+                "finding" if has_valid_verdict and normalized in verdict_map else "degraded"
+            ),
         )
 
     @staticmethod

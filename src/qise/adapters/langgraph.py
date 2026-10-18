@@ -35,7 +35,13 @@ import logging
 from collections.abc import Callable
 from typing import Any
 
-from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin
+from qise.adapters.base import (
+    AgentAdapter,
+    EgressCheckMixin,
+    IngressCheckMixin,
+    blocked_message,
+    tool_arguments,
+)
 from qise.core.shield import Shield
 
 logger = logging.getLogger("qise.adapters.langgraph")
@@ -114,26 +120,22 @@ class QiseLangGraphWrapper(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
         tool_description = getattr(tool, "description", "")
         args_schema = getattr(tool, "args_schema", None)
 
-        shield = self.shield
-        session_id = self.session_id
-
         # Create guarded function
         @functools.wraps(original_func)
         def guarded_func(*args: Any, **kwargs: Any) -> Any:
-            tool_args = kwargs if kwargs else {"args": str(args)}
-            result = shield.pipeline.run_egress(
-                __import__("qise.core.models", fromlist=["GuardContext"]).GuardContext(
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    session_id=session_id,
-                ),
+            tool_args = tool_arguments(original_func, args, kwargs)
+            result = self.check_tool_call(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                session_id=self.session_id,
             )
             if result.should_block:
-                reason = f"Qise blocked: {result.blocked_by}"
+                reason = blocked_message(result)
                 logger.warning("LangGraph: blocked %s — %s", tool_name, reason)
                 _raise_blocked(reason)
 
-            return original_func(*args, **kwargs)
+            output = original_func(*args, **kwargs)
+            return self.protect_tool_result(output, tool_name, self.session_id)
 
         # Try to create a new StructuredTool with the guarded func
         try:
@@ -152,15 +154,15 @@ class QiseLangGraphWrapper(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
             guarded_func.description = tool_description  # type: ignore[attr-defined]
             return guarded_func
 
-    def _wrap_callable(self, tool: Callable) -> Callable:
+    def _wrap_callable(self, tool: Callable, *, tool_name: str | None = None) -> Callable:
         """Wrap a plain callable with Qise security checks."""
         import functools
 
-        tool_name = getattr(tool, "name", None) or getattr(tool, "__name__", "unknown")
+        tool_name = tool_name or getattr(tool, "name", None) or getattr(tool, "__name__", "unknown")
 
         @functools.wraps(tool)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
-            tool_args = kwargs if kwargs else {"args": str(args)}
+            tool_args = tool_arguments(tool, args, kwargs)
 
             result = self.check_tool_call(
                 tool_name=tool_name,
@@ -169,11 +171,12 @@ class QiseLangGraphWrapper(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
             )
 
             if result.should_block:
-                reason = f"Qise blocked: {result.blocked_by}"
+                reason = blocked_message(result)
                 logger.warning("LangGraph: blocked %s — %s", tool_name, reason)
                 _raise_blocked(reason)
 
-            return tool(*args, **kwargs)
+            output = tool(*args, **kwargs)
+            return self.protect_tool_result(output, tool_name, self.session_id)
 
         wrapped.name = tool_name  # type: ignore[attr-defined]
         return wrapped
@@ -201,37 +204,33 @@ class QiseLangGraphWrapper(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
         tool_description = getattr(tool, "description", "")
         args_schema = getattr(tool, "args_schema", None)
 
-        shield = self.shield
-        session_id = self.session_id
-
         @functools.wraps(original_func or tool)
         async def guarded_coroutine(*args: Any, **kwargs: Any) -> Any:
-            tool_args = kwargs if kwargs else {"args": str(args)}
-            result = shield.pipeline.run_egress(
-                __import__("qise.core.models", fromlist=["GuardContext"]).GuardContext(
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    session_id=session_id,
-                ),
+            tool_args = tool_arguments(original_func or original_coroutine or tool, args, kwargs)
+            result = self.check_tool_call(
+                tool_name=tool_name,
+                tool_args=tool_args,
+                session_id=self.session_id,
             )
             if result.should_block:
-                reason = f"Qise blocked: {result.blocked_by}"
+                reason = blocked_message(result)
                 logger.warning("LangGraph: blocked %s — %s", tool_name, reason)
                 _raise_blocked(reason)
 
             if original_coroutine:
-                return await original_coroutine(*args, **kwargs)
-            # Sync func called from async context
-            if original_func:
-                return original_func(*args, **kwargs)
-            return await tool.ainvoke(tool_args)
+                output = await original_coroutine(*args, **kwargs)
+            elif original_func:
+                output = original_func(*args, **kwargs)
+            else:
+                output = await tool.ainvoke(tool_args)
+            return self.protect_tool_result(output, tool_name, self.session_id)
 
         # Try to create StructuredTool
         try:
             from langchain_core.tools import StructuredTool
 
             return StructuredTool.from_function(
-                func=original_func,
+                func=self._wrap_callable(original_func, tool_name=tool_name) if original_func else None,
                 coroutine=guarded_coroutine,
                 name=tool_name,
                 description=tool_description,
@@ -251,7 +250,7 @@ class QiseLangGraphWrapper(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
 
         @functools.wraps(tool)
         async def wrapped(*args: Any, **kwargs: Any) -> Any:
-            tool_args = kwargs if kwargs else {"args": str(args)}
+            tool_args = tool_arguments(tool, args, kwargs)
 
             result = self.check_tool_call(
                 tool_name=tool_name,
@@ -260,11 +259,12 @@ class QiseLangGraphWrapper(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
             )
 
             if result.should_block:
-                reason = f"Qise blocked: {result.blocked_by}"
+                reason = blocked_message(result)
                 logger.warning("LangGraph: blocked %s — %s", tool_name, reason)
                 _raise_blocked(reason)
 
-            return await tool(*args, **kwargs)
+            output = await tool(*args, **kwargs)
+            return self.protect_tool_result(output, tool_name, self.session_id)
 
         wrapped.name = tool_name  # type: ignore[attr-defined]
         return wrapped

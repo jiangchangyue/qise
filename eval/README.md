@@ -36,9 +36,28 @@ python -m eval.runner --dataset eval/datasets/ --mode rules-only
 # Limit sample count for quick tests
 python -m eval.runner --source agentdojo --limit 100
 
-# Compare modes (rules-only vs slm vs full)
-python -m eval.runner --source agentdojo --compare
+# Compare modes using explicitly configured SLM and LLM endpoints
+python -m eval.runner --dataset eval/datasets/ --config shield.yaml --compare
 ```
+
+## Mode and policy semantics
+
+- `rules-only` clears SLM, LLM and embedding configuration, including credentials.
+- `slm` keeps rule checks and the configured SLM, with LLM escalation disabled.
+- `full` keeps rule checks, SLM and LLM escalation.
+
+`slm` requires a nonempty SLM endpoint/model; `full` requires both SLM and LLM
+endpoint/model settings. Missing configuration is an error. Each mode and each
+evaluation run constructs a fresh Shield from a deep copy of the source config;
+guard state and model failure caches are not shared between modes. The configured
+`observe`/`enforce`/`off` modes apply to evaluation, just as they do at runtime.
+For example, an observed would-be block is a warning and fails an expected block.
+
+These modes select allowed model layers, not an assurance that every sample used
+inference: deterministic rules may short-circuit, and an unreachable configured
+model can trigger the runtime rule fallback. Record model availability and the
+configuration used alongside published results. POSIX main-thread evaluation has
+a best-effort sample alarm; Windows and worker threads rely on model HTTP timeouts.
 
 ## Benchmark Sources
 
@@ -63,6 +82,13 @@ Harmful agent behaviors with tool calls. Matches Qise's Egress + Output detectio
   - Fraud → Egress (ExfilGuard)
   - Disinfo/Harassment/Hate/Sexual → Output (OutputGuard)
 - Requires: `pip install datasets`
+
+These converters produce Qise classification inputs, not official end-to-end
+benchmark scores. In particular, AgentHarm prompts are mapped to synthetic command
+or output fields, and the AgentDojo converter currently prefers injection goals
+over recorded tool responses. They do not run the original agent environment or
+measure attack success against an agent. Inspect the converted inputs and class
+balance before interpreting results; a small `--limit` can omit benign examples.
 
 ### CyberSecEval 4 (Meta PurpleLlama on GitHub)
 
@@ -102,12 +128,30 @@ cases:
 
 ## Metrics
 
+The main report and per-source/category tables use **strict action metrics**:
+an expected block returned as a warning is a false negative. A separate **risk
+detection** table counts both warnings and blocks as detected risk. Detection F1
+must not be described as an attack blocking rate.
+
 | Metric | Description |
 |--------|-------------|
 | Precision | TP / (TP + FP) — accuracy of positive detections |
 | Recall | TP / (TP + FN) — coverage of actual attacks |
 | F1 | Harmonic mean of precision and recall |
 | FPR | FP / (FP + TN) — false positive rate on safe inputs |
+| Block recall | Actual blocks / samples requiring a block; `n/a` if there are none |
+| Expectation accuracy | Samples meeting the requested verdict / all samples, including errors |
+
+Pipeline exceptions/timeouts are reported as `error`, never as safe passes. They
+are excluded from confusion matrices, reported separately, and count against
+expectation accuracy and required-block recall. Per-guard diagnostics use each
+guard's own verdict on the samples it actually saw; short-circuit execution means
+those rows are not independent standalone guard benchmarks.
+
+Reports committed before this correction are historical artifacts: their mode
+labels did not themselves select model layers, and their F1 treated warnings as
+detections even when the expected verdict was block. Regenerate results with the
+corrected runner and an explicit configuration before making comparative claims.
 
 ## Report Format
 

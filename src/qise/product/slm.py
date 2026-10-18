@@ -17,7 +17,7 @@ from urllib.parse import urlparse
 import httpx
 import yaml
 
-from qise.product.service import load_state, logs_dir, now_iso, save_state
+from qise.product.service import atomic_write_text, is_pid_running, load_state, logs_dir, now_iso, qise_home, save_state
 
 DEFAULT_SLM_MODEL = "qwen3:4b"
 DEFAULT_SLM_BASE_URL = "http://localhost:11434/v1"
@@ -38,7 +38,7 @@ class SlmCommandResult:
 
 
 def _config_path(config_path: str | None = None) -> Path:
-    return Path(config_path or "shield.yaml").expanduser()
+    return Path(config_path).expanduser() if config_path else qise_home() / "shield.yaml"
 
 
 def _read_config(path: Path) -> dict[str, Any]:
@@ -49,8 +49,7 @@ def _read_config(path: Path) -> dict[str, Any]:
 
 
 def _write_config(path: Path, data: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
+    atomic_write_text(path, yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
 
 
 def _set_slm_config(
@@ -165,13 +164,7 @@ def _process_command(pid: int) -> str:
 
 
 def _pid_running(pid: int | None) -> bool:
-    if not pid:
-        return False
-    try:
-        os.kill(pid, 0)
-    except OSError:
-        return False
-    return True
+    return is_pid_running(pid)
 
 
 def _which(name: str) -> str | None:

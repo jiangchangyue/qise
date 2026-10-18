@@ -15,6 +15,7 @@ Core flow:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -27,7 +28,8 @@ from aiohttp import web
 from qise.proxy.config import ProxyConfig
 from qise.proxy.context_injector import ContextInjector
 from qise.proxy.interceptor import ProxyDecision, ProxyInterceptor
-from qise.proxy.parser import RequestParser, ResponseParser
+from qise.proxy.parser import ParsedRequest, RequestParser, ResponseParser
+from qise.proxy.responses_streaming import ResponsesSSEStreamHandler
 from qise.proxy.streaming import AnthropicSSEStreamHandler, SSEStreamHandler
 
 logger = logging.getLogger("qise.proxy")
@@ -187,8 +189,7 @@ class ProxyServer:
             return auth_route
 
         records_with_upstream = {
-            name: record for name, record in records.items()
-            if str(record.get("upstream_url") or "").strip()
+            name: record for name, record in records.items() if str(record.get("upstream_url") or "").strip()
         }
         if not agent_hint and len(records_with_upstream) == 1:
             name, record = next(iter(records_with_upstream.items()))
@@ -212,39 +213,51 @@ class ProxyServer:
         For all other paths, forward transparently.
         """
         raw_path = "/" + request.match_info.get("path", "")
+        if raw_path == "/_qise/health" and request.method == "GET":
+            from qise import __version__
+            from qise.product.service import profile_id
+
+            return web.json_response(
+                {
+                    "service": "qise-proxy",
+                    "version": __version__,
+                    "pid": os.getpid(),
+                    "instance_id": os.getenv("QISE_SERVICE_INSTANCE", ""),
+                    "profile_id": profile_id(),
+                }
+            )
         agent_name, path_without_query = self._canonical_path_and_agent(raw_path)
 
         # Check if this path should be intercepted
         should_intercept = any(
-            path_without_query == ip or path_without_query.startswith(ip + "/")
-            for ip in self._config.intercept_paths
+            path_without_query == ip or path_without_query.startswith(ip + "/") for ip in self._config.intercept_paths
         )
 
         # Check if this path should passthrough without interception
-        is_passthrough = any(
-            path_without_query == pp
-            for pp in self._config.passthrough_paths
-        )
+        is_passthrough = any(path_without_query == pp for pp in self._config.passthrough_paths)
 
         if is_passthrough or not should_intercept:
-            return await self._forward_request(
-                request, path_override=path_without_query, agent_name=agent_name
-            )
+            return await self._forward_request(request, path_override=path_without_query, agent_name=agent_name)
 
         # Intercept chat completion requests
         if path_without_query == "/v1/chat/completions" and request.method == "POST":
-            return await self._handle_chat_completions(
-                request, path_override=path_without_query, agent_name=agent_name
-            )
+            return await self._handle_chat_completions(request, path_override=path_without_query, agent_name=agent_name)
         if path_without_query == "/v1/messages" and request.method == "POST":
             return await self._handle_anthropic_messages(
                 request, path_override=path_without_query, agent_name=agent_name
             )
 
+        if path_without_query == "/v1/responses" and request.method == "POST":
+            return await self._handle_responses(request, path_override=path_without_query, agent_name=agent_name)
+        if (
+            request.method == "GET"
+            and path_without_query.startswith("/v1/responses/")
+            and len(path_without_query.split("/")) == 4
+        ):
+            return await self._handle_responses(request, path_override=path_without_query, agent_name=agent_name)
+
         # Other paths on intercepted routes: just forward
-        return await self._forward_request(
-            request, path_override=path_without_query, agent_name=agent_name
-        )
+        return await self._forward_request(request, path_override=path_without_query, agent_name=agent_name)
 
     async def _handle_chat_completions(
         self,
@@ -253,90 +266,9 @@ class ProxyServer:
         path_override: str | None = None,
         agent_name: str = "",
     ) -> web.Response:
-        """Handle /v1/chat/completions with full interception pipeline.
-
-        Supports both streaming and non-streaming requests.
-        """
-        try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception) as e:
-            return web.json_response(
-                {"error": f"Invalid JSON in request body: {e}"},
-                status=400,
-            )
-
-        route = self._resolve_route(request, body, agent_name)
-        agent_name = route.agent_name or agent_name
-
-        # Step 1: Parse request
-        parsed_request = self._request_parser.parse(body)
-
-        # Step 2: Request interception (run in thread to avoid blocking event loop)
-        import asyncio
-        request_decision = await asyncio.to_thread(
-            self._interceptor.intercept_request, parsed_request, body, agent_name
+        return await self._handle_model_request(
+            request, path_override=path_override, agent_name=agent_name, api_format="openai"
         )
-
-        if request_decision.action == "block" and self._config.block_on_guard_block:
-            logger.warning("Request BLOCKED: %s", request_decision.block_reason)
-            return self._block_response(request_decision)
-
-        # Step 3: Inject security context
-        forward_body = request_decision.modified_body
-        if self._config.inject_security_context:
-            forward_body = self._context_injector.inject(forward_body)
-
-        # Step 4: Check if streaming
-        is_stream = parsed_request.stream
-
-        # Step 5: Forward to upstream
-        if is_stream:
-            return await self._handle_streaming(
-                request,
-                forward_body,
-                path_override=path_override,
-                route=route,
-                agent_name=agent_name,
-                api_format="openai",
-            )
-
-        # Non-streaming path
-        upstream_response = await self._forward_to_upstream(
-            request, forward_body, path_override=path_override, route=route, api_format="openai"
-        )
-        if upstream_response.status != 200:
-            return upstream_response
-
-        # Step 6: Parse response
-        try:
-            response_body = self._response_json(upstream_response)
-        except Exception:
-            return upstream_response
-
-        # Step 7: Response interception (run in thread to avoid blocking event loop)
-        import asyncio
-        parsed_response = self._response_parser.parse(response_body)
-        response_decision = await asyncio.to_thread(
-            self._interceptor.intercept_response, parsed_response, response_body, agent_name
-        )
-
-        # Step 8: Return response
-        if response_decision.action == "block" and self._config.block_on_guard_block:
-            logger.warning("Response BLOCKED: %s", response_decision.block_reason)
-            return self._block_response(response_decision)
-
-        if response_decision.action == "warn":
-            headers = {"X-Qise-Warnings": "; ".join(response_decision.warnings[:5])}
-            # Add metrics header if available
-            if hasattr(self._shield, "metrics"):
-                headers["X-Qise-Metrics"] = self._shield.metrics.brief()
-            return web.json_response(response_body, headers=headers)
-
-        # Add metrics header to normal responses if available
-        resp_headers = {}
-        if hasattr(self._shield, "metrics"):
-            resp_headers["X-Qise-Metrics"] = self._shield.metrics.brief()
-        return web.json_response(response_body, headers=resp_headers)
 
     async def _handle_anthropic_messages(
         self,
@@ -345,33 +277,65 @@ class ProxyServer:
         path_override: str | None = None,
         agent_name: str = "",
     ) -> web.Response:
-        """Handle Anthropic /v1/messages with the full interception pipeline."""
+        return await self._handle_model_request(
+            request, path_override=path_override, agent_name=agent_name, api_format="anthropic"
+        )
+
+    async def _handle_responses(
+        self,
+        request: web.Request,
+        *,
+        path_override: str | None = None,
+        agent_name: str = "",
+    ) -> web.Response:
+        return await self._handle_model_request(
+            request, path_override=path_override, agent_name=agent_name, api_format="responses"
+        )
+
+    async def _handle_model_request(
+        self,
+        request: web.Request,
+        *,
+        path_override: str | None,
+        agent_name: str,
+        api_format: str,
+    ) -> web.Response:
+        request_method = getattr(request, "method", "POST")
+        request_parser = {
+            "openai": self._request_parser.parse,
+            "anthropic": self._request_parser.parse_anthropic,
+            "responses": self._request_parser.parse_responses,
+        }[api_format]
+        response_parser = {
+            "openai": self._response_parser.parse,
+            "anthropic": self._response_parser.parse_anthropic,
+            "responses": self._response_parser.parse_responses,
+        }[api_format]
+        injector = {
+            "openai": self._context_injector.inject,
+            "anthropic": self._context_injector.inject_anthropic,
+            "responses": self._context_injector.inject_responses,
+        }[api_format]
         try:
-            body = await request.json()
-        except (json.JSONDecodeError, Exception) as e:
-            return web.json_response(
-                {"type": "error", "error": {"type": "invalid_request_error", "message": f"Invalid JSON: {e}"}},
-                status=400,
-            )
+            body = {} if request_method == "GET" else await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("Request body must be a JSON object")
+            parsed_request = request_parser(body)
+            if request_method == "GET":
+                parsed_request.stream = getattr(request, "query", {}).get("stream") == "true"
+        except (ValueError, TypeError, AttributeError) as exc:
+            return web.json_response({"error": {"type": "invalid_request_error", "message": str(exc)}}, status=400)
 
         route = self._resolve_route(request, body, agent_name)
         agent_name = route.agent_name or agent_name
-
-        parsed_request = self._request_parser.parse_anthropic(body)
-
-        import asyncio
         request_decision = await asyncio.to_thread(
             self._interceptor.intercept_request, parsed_request, body, agent_name
         )
-
         if request_decision.action == "block" and self._config.block_on_guard_block:
-            logger.warning("Anthropic request BLOCKED: %s", request_decision.block_reason)
-            return self._block_response(request_decision, api_format="anthropic")
-
-        forward_body = request_decision.modified_body
-        if self._config.inject_security_context:
-            forward_body = self._context_injector.inject_anthropic(forward_body)
-
+            return self._block_response(request_decision, api_format=api_format)
+        forward_body = None if request_method == "GET" else request_decision.modified_body
+        if self._config.inject_security_context and forward_body is not None:
+            forward_body = injector(forward_body)
         if parsed_request.stream:
             return await self._handle_streaming(
                 request,
@@ -379,7 +343,8 @@ class ProxyServer:
                 path_override=path_override,
                 route=route,
                 agent_name=agent_name,
-                api_format="anthropic",
+                api_format=api_format,
+                request_context=parsed_request,
             )
 
         upstream_response = await self._forward_to_upstream(
@@ -387,31 +352,38 @@ class ProxyServer:
             forward_body,
             path_override=path_override,
             route=route,
-            api_format="anthropic",
+            api_format=api_format,
         )
         if upstream_response.status != 200:
             return upstream_response
-
         try:
             response_body = self._response_json(upstream_response)
-        except Exception:
-            return upstream_response
-
-        parsed_response = self._response_parser.parse_anthropic(response_body)
-        response_decision = await asyncio.to_thread(
-            self._interceptor.intercept_response, parsed_response, response_body, agent_name
+            parsed_response = response_parser(response_body)
+        except (ValueError, TypeError, AttributeError):
+            return web.json_response(
+                {"error": {"type": "qise_upstream_error", "message": "Upstream returned an invalid model response"}},
+                status=502,
+            )
+        decision = await asyncio.to_thread(
+            self._interceptor.intercept_response,
+            parsed_response,
+            response_body,
+            agent_name,
+            parsed_request,
         )
-
-        if response_decision.action == "block" and self._config.block_on_guard_block:
-            logger.warning("Anthropic response BLOCKED: %s", response_decision.block_reason)
-            return self._block_response(response_decision, api_format="anthropic")
-
-        headers = {}
-        if response_decision.action == "warn":
-            headers["X-Qise-Warnings"] = "; ".join(response_decision.warnings[:5])
+        if decision.action == "block" and self._config.block_on_guard_block:
+            return self._block_response(decision, api_format=api_format)
+        headers = {
+            key: value
+            for key, value in upstream_response.headers.items()
+            if key.lower() not in {"content-length", "content-type", "content-encoding"}
+        }
+        warnings = request_decision.warnings + decision.warnings
+        if warnings:
+            headers["X-Qise-Warnings"] = "; ".join(warnings[:5]).replace("\n", " ").replace("\r", " ")[:1000]
         if hasattr(self._shield, "metrics"):
             headers["X-Qise-Metrics"] = self._shield.metrics.brief()
-        return web.json_response(response_body, headers=headers)
+        return web.json_response(decision.modified_body, headers=headers)
 
     def _upstream_url(self, path: str, upstream_base_url: str | None = None) -> str:
         base = (upstream_base_url if upstream_base_url is not None else self._config.upstream_base_url).rstrip("/")
@@ -463,12 +435,13 @@ class ProxyServer:
     async def _handle_streaming(
         self,
         request: web.Request,
-        forward_body: dict[str, Any],
+        forward_body: dict[str, Any] | None,
         *,
         path_override: str | None = None,
         route: ResolvedProxyRoute | None = None,
         agent_name: str = "",
         api_format: str = "openai",
+        request_context: ParsedRequest | None = None,
     ) -> web.StreamResponse:
         """Handle streaming (SSE) chat completion requests.
 
@@ -483,6 +456,8 @@ class ProxyServer:
             )
             return resp  # type: ignore[return-value]
         upstream_url = self._upstream_url(path, route.upstream_base_url)
+        if query := getattr(request, "query_string", ""):
+            upstream_url += "?" + query
 
         headers = self._build_forward_headers(request, route, api_format=api_format, streaming=True)
 
@@ -491,13 +466,13 @@ class ProxyServer:
         # Open streaming connection to upstream
         try:
             upstream_resp = await session.request(
-                method="POST",
+                method=request.method,
                 url=upstream_url,
                 headers=headers,
                 json=forward_body,
                 timeout=aiohttp.ClientTimeout(total=self._config.request_timeout_s),
             )
-        except aiohttp.ClientError as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             logger.error("Upstream streaming request failed: %s", e)
             resp = web.json_response(
                 {"error": f"Upstream request failed: {e}"},
@@ -505,24 +480,37 @@ class ProxyServer:
             )
             return resp  # type: ignore[return-value]
 
-        # Set up streaming response
+        if upstream_resp.status != 200:
+            try:
+                data = await upstream_resp.read()
+                return web.Response(body=data, status=upstream_resp.status, content_type=upstream_resp.content_type)
+            finally:
+                upstream_resp.release()
         stream_resp = web.StreamResponse(
             status=upstream_resp.status,
-            headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"},
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "X-Qise-Text-Inspection": "post-stream-audit",
+            },
         )
-        await stream_resp.prepare(request)
-
-        # Process the SSE stream
-        if api_format == "anthropic":
-            handler = AnthropicSSEStreamHandler(self._interceptor, agent_name=route.agent_name or agent_name)
-        else:
-            handler = SSEStreamHandler(self._interceptor, agent_name=route.agent_name or agent_name)
-        async for chunk in handler.process_stream(upstream_resp):
-            await stream_resp.write(chunk)
-
-        await upstream_resp.release()
-        await stream_resp.write_eof()
-        return stream_resp
+        try:
+            await stream_resp.prepare(request)
+            handler_class = {
+                "openai": SSEStreamHandler,
+                "anthropic": AnthropicSSEStreamHandler,
+                "responses": ResponsesSSEStreamHandler,
+            }[api_format]
+            handler = handler_class(
+                self._interceptor, agent_name=route.agent_name or agent_name, request_context=request_context
+            )
+            async for chunk in handler.process_stream(upstream_resp):
+                await stream_resp.write(chunk)
+            await stream_resp.write_eof()
+            return stream_resp
+        finally:
+            # release() is synchronous, and must also run on disconnect/cancellation.
+            upstream_resp.release()
 
     async def _forward_request(
         self,
@@ -564,6 +552,8 @@ class ProxyServer:
             )
         path = path_override or self._canonical_path_and_agent("/" + request.match_info.get("path", ""))[1]
         upstream_url = self._upstream_url(path, route.upstream_base_url)
+        if query := getattr(request, "query_string", ""):
+            upstream_url += "?" + query
         api_format = api_format or self._api_format_for_path(path)
         headers = self._build_forward_headers(request, route, api_format=api_format)
 
@@ -596,7 +586,7 @@ class ProxyServer:
                     content_type=content_type,
                     headers=resp_headers,
                 )
-        except aiohttp.ClientError as e:
+        except (TimeoutError, aiohttp.ClientError) as e:
             logger.error("Upstream request failed: %s", e)
             return web.json_response(
                 {"error": f"Upstream request failed: {e}"},

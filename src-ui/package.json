@@ -1,11 +1,13 @@
 {
   "name": "qise-ui",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:browser": "vite --mode browser --host 127.0.0.1",
     "build": "tsc && vite build",
+    "build:browser": "tsc && vite build --mode browser",
     "preview": "vite preview",
     "test": "vitest run"
   },

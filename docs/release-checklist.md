@@ -93,36 +93,38 @@ Pass criteria:
 
 ### One-time repository setup
 
-Keep the updater private key backed up outside the repository. The current local key path is:
+This fork publishes desktop releases to `jiangchangyue/qise` and uses its own updater signing key. The public key in `src-tauri/tauri.conf.json` must match that private key, and the updater endpoint must point to this repository:
 
 ```text
-~/.tauri/qise-updater.key
+https://github.com/jiangchangyue/qise/releases/latest/download/latest.json
 ```
 
-Add its content to the GitHub repository secret `TAURI_SIGNING_PRIVATE_KEY`. With GitHub CLI:
+Keep a secure private-key backup outside the repository and any build artifacts. The following commands use `/secure/private-backup/qise-updater.key` as an example; replace it with the actual protected backup path. Add the exact file contents to the repository secret:
 
 ```bash
-gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/qise-updater.key
+gh secret set TAURI_SIGNING_PRIVATE_KEY --repo jiangchangyue/qise < /secure/private-backup/qise-updater.key
 ```
 
 When using the GitHub website on macOS, copy the exact file contents without
 printing them in the terminal:
 
 ```bash
-pbcopy < ~/.tauri/qise-updater.key
+pbcopy < /secure/private-backup/qise-updater.key
 ```
 
 Then paste into the secret value field. Do not copy the `%` marker that zsh may
 display after `cat` when a file has no trailing newline.
 
-The current key has no password, so `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` may remain unset. If the key is replaced with a password-protected key, add that password as the second secret. Never commit or print the private key in logs.
+For an unencrypted key, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` may remain unset. For a password-protected key, add its password as that second secret. Never commit or print the private key in logs. Forks do not inherit the upstream repository's secrets.
+
+The desktop release workflow uses the repository's `GITHUB_TOKEN` with `contents: write`; a separate release access token is not required. Enable GitHub Actions for the fork before pushing a release tag.
 
 ### Prepare and trigger a stable release
 
-All release-bearing files must use the same semantic version. For Qise 0.2.0:
+All release-bearing files must use the same semantic version, including the `qise-app` entry in `src-tauri/Cargo.lock`. For Qise 0.2.1:
 
 ```bash
-python scripts/check_release_version.py --expected 0.2.0
+python scripts/check_release_version.py --expected 0.2.1
 PYTHONPATH=src pytest tests/test_release_version.py tests/test_cli.py tests/test_product_cli.py -q
 npm test --prefix src-ui
 npm run build --prefix src-ui
@@ -134,26 +136,28 @@ Commit and push the release-ready source, then create the matching tag:
 
 ```bash
 git push origin main
-git tag -a v0.2.0 -m "Qise v0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "Qise v0.2.1"
+git push origin v0.2.1
 ```
 
-The `Publish Desktop Release` workflow builds Windows x64 and macOS Apple Silicon, signs updater artifacts, generates `latest.json`, and creates a draft GitHub Release.
+The tag triggers `Publish Desktop Release`, which builds Windows x64 and macOS Apple Silicon, signs updater artifacts, generates `latest.json`, and creates a draft GitHub Release. Wait for both platform jobs to succeed before publishing.
 
 Before publishing the draft, confirm it contains:
 
 - macOS DMG for first installation.
 - macOS updater archive and `.sig`.
 - Windows x64 NSIS installer and `.sig`.
-- `latest.json` with `darwin-aarch64` and `windows-x86_64`.
+- `latest.json` with version `0.2.1`, signed `darwin-aarch64` and `windows-x86_64` entries, and asset URLs pointing to `jiangchangyue/qise`.
 
-Publish the draft as a stable, non-prerelease Release. Publishing also triggers the existing PyPI workflow. Verify the public updater manifest:
+Check that each updater artifact verifies against the configured public key. Updater signatures do not provide Apple Developer ID notarization or Windows Authenticode signing; document these installation limitations in the release notes.
+
+Once both platforms' assets have been checked, publish the draft as a stable, non-prerelease Release. The PyPI workflow is restricted to the upstream `WhitzardAgent/qise` repository; this fork publishes desktop releases without publishing a PyPI package. Verify the public updater manifest:
 
 ```bash
-curl -fsSL https://github.com/WhitzardAgent/qise/releases/latest/download/latest.json
+curl -fsSL https://github.com/jiangchangyue/qise/releases/latest/download/latest.json
 ```
 
-Users of an earlier 0.2.0 desktop build must manually install this updater-enabled 0.2.0 build once. Test end-to-end automatic updating with the next higher signed version.
+Users of upstream desktop builds must manually install this fork's 0.2.1 build once to adopt its update channel and signing key. Subsequent updates come from this repository. Test end-to-end automatic updating with the next higher signed version.
 
 ## 7. GitHub Hygiene
 

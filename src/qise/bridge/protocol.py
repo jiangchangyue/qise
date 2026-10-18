@@ -43,6 +43,7 @@ class GuardResultSummary(BaseModel):
     verdict: str
     message: str = ""
     latency_ms: int = 0
+    evidence_kind: str = "finding"
 
 
 class GuardCheckResponse(BaseModel):

@@ -8,10 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
-import signal
 import sys
-
-from qise.bridge.server import BridgeServer
 
 logger = logging.getLogger("qise.bridge.cli")
 
@@ -25,14 +22,14 @@ def add_bridge_parser(subparsers: argparse._SubParsersAction) -> None:
     start_parser = bridge_subparsers.add_parser("start", help="Start Python Bridge server")
     start_parser.add_argument("--port", type=int, default=8823, help="Listen port (default: 8823)")
     start_parser.add_argument("--host", default="127.0.0.1", help="Listen host (default: 127.0.0.1)")
-    start_parser.add_argument("--config", default=None, help="Path to shield.yaml")
+    start_parser.add_argument("--config", default=argparse.SUPPRESS, help="Path to shield.yaml")
 
 
 def cmd_bridge_start(args: argparse.Namespace) -> int:
     """Handle `qise bridge start` — start the Bridge HTTP server."""
-    from qise.core.shield import Shield
-
-    shield = Shield.from_config(args.config)
+    from qise.bridge.server import BridgeServer
+    from qise.cli import _get_shield
+    shield = _get_shield(args.config)
     server = BridgeServer(
         shield=shield,
         port=args.port,
@@ -57,8 +54,8 @@ def cmd_bridge_start(args: argparse.Namespace) -> int:
             def _signal_handler() -> None:
                 stop_event.set()
 
-            loop.add_signal_handler(signal.SIGINT, _signal_handler)
-            loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+            from qise.product.service import install_stop_handlers
+            install_stop_handlers(loop, stop_event)
 
             await stop_event.wait()
         finally:

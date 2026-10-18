@@ -2,6 +2,15 @@
 
 Training data pipeline for QiseGuard-SLM — a dedicated security classification model for AI agent runtime protection.
 
+This directory currently prepares data and a proposed training configuration; it
+does not include a training entry point or a validated model release. Schema
+validation is not a measure of semantic diversity: the checked-in synthetic files
+contain 2,407 examples, including 1,124 repeated user prompts within files (46.7%).
+The validator reports these repeats separately from schema errors. Before training,
+deduplicate examples and split by source/attack template to keep related variants
+out of both training and evaluation; the current converter only exports training
+files. A random validation split alone does not establish held-out attack coverage.
+
 ## Directory Structure
 
 ```

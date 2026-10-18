@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+_DEFAULT_PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 
 @dataclass
@@ -29,7 +31,7 @@ class PromptExampleLoader:
     def __init__(self, prompts_dir: Path | None = None) -> None:
         if prompts_dir is None:
             # Default: project data/prompts/ directory
-            prompts_dir = Path(__file__).resolve().parent.parent / "data" / "prompts"
+            prompts_dir = _DEFAULT_PROMPTS_DIR
         self.prompts_dir = prompts_dir
         self._cache: dict[str, list[PromptExample]] = {}
 
@@ -93,7 +95,8 @@ class PromptExampleLoader:
 
         # Select diverse negatives by trust_boundary or tool_name
         selected_neg = self._select_by_diversity(
-            negatives, max_negative, key=lambda e: e.input_data.get("trust_boundary", e.input_data.get("tool_name", "unknown")),
+            negatives, max_negative,
+            key=lambda e: e.input_data.get("trust_boundary", e.input_data.get("tool_name", "unknown")),
         )
 
         return selected_pos + selected_neg

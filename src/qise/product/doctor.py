@@ -80,9 +80,8 @@ def run_doctor(config_path: str | None = None) -> dict[str, Any]:
                 slm_detail += f" ({slm_report['verification']})"
                 warnings.append("Local SLM is configured but not ready. Run `qise slm status` or `qise slm start`.")
         else:
-            slm_detail = "not configured"
-            slm_check_status = "warning"
-            warnings.append("Local SLM is optional and not configured.")
+            slm_detail = "not configured (optional; lightweight rules are available)"
+            slm_check_status = "ok"
     except Exception as exc:
         slm_detail = f"status check failed: {exc}"
         slm_check_status = "warning"

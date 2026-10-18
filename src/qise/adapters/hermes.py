@@ -31,11 +31,18 @@ Usage:
 from __future__ import annotations
 
 import functools
+import inspect
 import logging
 from collections.abc import Callable
 from typing import Any
 
-from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin
+from qise.adapters.base import (
+    AgentAdapter,
+    EgressCheckMixin,
+    IngressCheckMixin,
+    blocked_message,
+    tool_arguments,
+)
 from qise.core.shield import Shield
 
 logger = logging.getLogger("qise.adapters.hermes")
@@ -81,7 +88,7 @@ class QiseHermesAdapter(AgentAdapter, EgressCheckMixin, IngressCheckMixin):
 
         @functools.wraps(tool)
         def wrapped(*args: Any, **kwargs: Any) -> Any:
-            tool_args = kwargs if kwargs else {"args": str(args)}
+            tool_args = tool_arguments(tool, args, kwargs)
 
             result = self.check_tool_call(
                 tool_name=tool_name,
@@ -90,11 +97,26 @@ class QiseHermesAdapter(AgentAdapter, EgressCheckMixin, IngressCheckMixin):
             )
 
             if result.should_block:
-                reason = f"Qise blocked: {result.blocked_by}"
+                reason = blocked_message(result)
                 logger.warning("Hermes: blocked %s — %s", tool_name, reason)
                 raise RuntimeError(reason)
 
-            return tool(*args, **kwargs)
+            output = tool(*args, **kwargs)
+            return self.protect_tool_result(output, tool_name, self.session_id)
+
+        if inspect.iscoroutinefunction(tool):
+            @functools.wraps(tool)
+            async def async_wrapped(*args: Any, **kwargs: Any) -> Any:
+                result = self.check_tool_call(
+                    tool_name, tool_arguments(tool, args, kwargs), self.session_id,
+                )
+                if result.should_block:
+                    raise RuntimeError(blocked_message(result))
+                output = await tool(*args, **kwargs)
+                return self.protect_tool_result(output, tool_name, self.session_id)
+
+            async_wrapped.name = tool_name
+            return async_wrapped
 
         wrapped.name = tool_name  # type: ignore[attr-defined]
         return wrapped

@@ -6,12 +6,30 @@ EgressCheckMixin to route content through the Guard Pipeline.
 
 from __future__ import annotations
 
-import time
 from abc import ABC, abstractmethod
 from typing import Any
 
-from qise.core.models import GuardContext, PipelineResult, ToolCallRecord
+from qise.core.models import GuardContext, GuardVerdict, PipelineResult
 from qise.core.shield import Shield
+
+
+def blocked_message(result: PipelineResult) -> str:
+    """Explain why a caller must stop instead of executing or exposing data."""
+    if result.verdict == GuardVerdict.APPROVE:
+        return f"Agent360 requires human approval before execution: {result.blocked_by}"
+    return f"Agent360 blocked: {result.blocked_by}"
+
+
+def tool_arguments(tool: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Inspect the values actually passed to a callable, including defaults."""
+    import inspect
+
+    try:
+        bound = inspect.signature(tool).bind(*args, **kwargs)
+        bound.apply_defaults()
+        return dict(bound.arguments)
+    except (TypeError, ValueError):
+        return {"_positional": str(args), **kwargs}
 
 
 class IngressCheckMixin:
@@ -37,15 +55,7 @@ class IngressCheckMixin:
             session_id=session_id,
             integration_mode=self._integration_mode(),
         )
-        guard_modes = {
-            name: self.shield.config.guard_mode(name)
-            for name in self.shield.config.guards.enabled
-        }
-        result = self.shield.pipeline.run_ingress(ctx, guard_modes)
-        if session_id:
-            for gr in result.results:
-                self.shield.session_tracker.record_guard_result(session_id, gr)
-        return result
+        return self.shield.check_sync(ctx, pipeline_kind="ingress")
 
     def check_tool_result(
         self,
@@ -61,15 +71,27 @@ class IngressCheckMixin:
             session_id=session_id,
             integration_mode=self._integration_mode(),
         )
-        guard_modes = {
-            name: self.shield.config.guard_mode(name)
-            for name in self.shield.config.guards.enabled
-        }
-        result = self.shield.pipeline.run_ingress(ctx, guard_modes)
-        if session_id:
-            for gr in result.results:
-                self.shield.session_tracker.record_guard_result(session_id, gr)
-        return result
+        return self.shield.check_sync(ctx, pipeline_kind="ingress")
+
+    def protect_tool_result(
+        self, output: Any, tool_name: str = "", session_id: str | None = None,
+        *, apply_transforms: bool = False,
+    ) -> Any:
+        """Stop blocked results and apply checked text transformations.
+
+        Generic callable wrappers preserve their return contract, including
+        machine-readable strings. Consumers handing text directly to a model
+        can opt into isolation banners with apply_transforms=True. Structured
+        results retain their original type.
+        """
+        result = self.check_tool_result(str(output), tool_name, session_id)
+        if result.should_block:
+            raise RuntimeError(blocked_message(result))
+        if apply_transforms and isinstance(output, str) and result.transformed_args is not None:
+            content = result.transformed_args.get("content")
+            if isinstance(content, str):
+                return content
+        return output
 
     def _integration_mode(self) -> str:
         return "sdk"
@@ -95,33 +117,14 @@ class EgressCheckMixin:
 
         Auto-fills active_security_rules from SecurityContextProvider.
         """
-        security_rules = self._get_security_rules(tool_name, tool_args)
         ctx = GuardContext(
             tool_name=tool_name,
             tool_args=tool_args,
             session_id=session_id,
             integration_mode=self._integration_mode(),
-            active_security_rules=security_rules,
             **kwargs,
         )
-        guard_modes = {
-            name: self.shield.config.guard_mode(name)
-            for name in self.shield.config.guards.enabled
-        }
-        result = self.shield.pipeline.run_egress(ctx, guard_modes)
-        if session_id:
-            for gr in result.results:
-                self.shield.session_tracker.record_guard_result(session_id, gr)
-            self.shield.session_tracker.record_tool_call(
-                session_id,
-                ToolCallRecord(
-                    tool_name=tool_name,
-                    tool_args=tool_args,
-                    verdict=result.verdict,
-                    timestamp=time.time(),
-                ),
-            )
-        return result
+        return self.shield.check_sync(ctx, pipeline_kind="egress")
 
     def check_output(
         self,
@@ -143,15 +146,7 @@ class EgressCheckMixin:
             session_id=session_id,
             integration_mode=self._integration_mode(),
         )
-        guard_modes = {
-            name: self.shield.config.guard_mode(name)
-            for name in self.shield.config.guards.enabled
-        }
-        result = self.shield.pipeline.run_output(ctx, guard_modes)
-        if session_id:
-            for gr in result.results:
-                self.shield.session_tracker.record_guard_result(session_id, gr)
-        return result
+        return self.shield.check_sync(ctx, pipeline_kind="output")
 
     def _integration_mode(self) -> str:
         return "sdk"

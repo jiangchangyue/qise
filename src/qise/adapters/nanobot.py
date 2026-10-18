@@ -29,17 +29,11 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin
+from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin, blocked_message
 from qise.core.shield import Shield
 
 logger = logging.getLogger("qise.adapters.nanobot")
 
-# Try to import Nanobot's AgentHook base class for forward compatibility
-_AgentHook: type | None = None
-try:
-    from nanobot.agent.hook import AgentHook as _AgentHook
-except ImportError:
-    pass
 
 
 class QiseNanobotHook(AgentAdapter, EgressCheckMixin, IngressCheckMixin):
@@ -160,6 +154,12 @@ class QiseNanobotHook(AgentAdapter, EgressCheckMixin, IngressCheckMixin):
                         tool_name,
                         result.blocked_by,
                     )
+                    tool_results[i] = blocked_message(result)
+                    raise RuntimeError(blocked_message(result))
+                if isinstance(tr, str) and result.transformed_args is not None:
+                    checked_content = result.transformed_args.get("content")
+                    if isinstance(checked_content, str):
+                        tool_results[i] = checked_content
 
         # Check final output for leaks
         final_content = getattr(context, "final_content", None)
@@ -170,6 +170,8 @@ class QiseNanobotHook(AgentAdapter, EgressCheckMixin, IngressCheckMixin):
             )
             if result.should_block:
                 logger.warning("Nanobot: output blocked — %s", result.blocked_by)
+                context.final_content = blocked_message(result)
+                raise RuntimeError(blocked_message(result))
 
     def _inject_security_context(self, context: Any) -> None:
         """Inject security context into the messages list.

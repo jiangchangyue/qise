@@ -15,6 +15,7 @@ from qise.core.models import (
     GuardContext,
     GuardResult,
     GuardVerdict,
+    ModelUnavailableError,
 )
 
 # ---------------------------------------------------------------------------
@@ -107,7 +108,7 @@ Output: {{"verdict": "safe", "confidence": 0.97, "risk_source": "none", "reasoni
     llm_prompt_template = None  # SLM is sufficient for reasoning analysis
     rule_fallback = None  # No rule fallback — AI only
 
-    def check(self, context: GuardContext) -> GuardResult:
+    def _check_impl(self, context: GuardContext) -> GuardResult:
         """Override: custom logic for reasoning analysis.
 
         Flow:
@@ -126,13 +127,14 @@ Output: {{"verdict": "safe", "confidence": 0.97, "risk_source": "none", "reasoni
         try:
             slm_result = self._slm_check(context)
             return self._process_slm_result(slm_result)
-        except Exception:
+        except ModelUnavailableError:
             # Model unavailable — conservative WARN
             return GuardResult(
                 guard_name=self.name,
                 verdict=GuardVerdict.WARN,
                 confidence=0.3,
                 message="Security models unavailable; cannot analyze agent reasoning",
+                evidence_kind="degraded",
             )
 
     def _process_slm_result(self, result: GuardResult) -> GuardResult:
@@ -169,4 +171,5 @@ Output: {{"verdict": "safe", "confidence": 0.97, "risk_source": "none", "reasoni
             risk_attribution=result.risk_attribution,
             threshold_adjustments=adjustments if adjustments else None,
             model_used=result.model_used,
+            evidence_kind=result.evidence_kind,
         )

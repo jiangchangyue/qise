@@ -9,10 +9,9 @@ Supports:
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
-
-import re
 
 import yaml
 from pydantic import BaseModel, Field
@@ -25,7 +24,7 @@ from qise.models.router import ModelConfig
 
 
 class IntegrationProxyConfig(BaseModel):
-    port: int = 8822
+    port: int = Field(default=8822, ge=1, le=65535)
     target_agents: list[str] = Field(default_factory=lambda: ["claude_code"])
     auto_takeover: bool = True
     crash_recovery: bool = True
@@ -36,6 +35,7 @@ class IntegrationProxyConfig(BaseModel):
 class IntegrationConfig(BaseModel):
     mode: Literal["proxy", "mcp", "sdk"] = "sdk"
     proxy: IntegrationProxyConfig = Field(default_factory=IntegrationProxyConfig)
+    bridge_port: int = Field(default=8823, ge=1, le=65535)
     mcp: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -227,8 +227,11 @@ class ShieldConfig(BaseModel):
 
         if val := os.getenv("QISE_MODE"):
             # Global guard mode override — apply to all guards
-            for name in self.guards.config:
-                self.guards.config[name].mode = val  # type: ignore[assignment]
+            if val not in {"observe", "enforce", "off"}:
+                raise ValueError("QISE_MODE must be observe, enforce, or off")
+            for name in self.guards.enabled:
+                current = self.guards.config.get(name, GuardConfig())
+                self.guards.config[name] = current.model_copy(update={"mode": val})
 
     # ------------------------------------------------------------------
     # Convenience accessors

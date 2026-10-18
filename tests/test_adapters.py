@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
 
 import pytest
 
-from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin
+from qise.adapters.base import EgressCheckMixin, IngressCheckMixin
 from qise.adapters.hermes import QiseHermesAdapter
 from qise.adapters.nanobot import QiseNanobotHook
 from qise.core.shield import Shield
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -217,7 +215,7 @@ class TestHermesAdapter:
             return f"ran {command}"
 
         wrapped = adapter.wrap_tool(bash)
-        with pytest.raises(RuntimeError, match="Qise blocked"):
+        with pytest.raises(RuntimeError, match="blocked"):
             wrapped(command="rm -rf /")
 
     def test_wrap_tool_allows_safe(self, shield: Shield) -> None:

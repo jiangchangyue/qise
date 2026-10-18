@@ -13,11 +13,10 @@ from __future__ import annotations
 
 import statistics
 import time
+from math import ceil
 
 from qise.core.models import GuardContext
 from qise.core.shield import Shield
-from qise.providers.security_context import SecurityContextProvider
-
 
 # Number of iterations for reliable measurement
 _WARMUP = 3
@@ -42,8 +41,11 @@ def _measure(func, iters: int = _ITERS, warmup: int = _WARMUP) -> list[float]:
 def _report(name: str, times: list[float], budget_ms: float) -> None:
     """Print timing report and assert budget is met (p95)."""
     p50 = statistics.median(times)
-    p95 = sorted(times)[int(len(times) * 0.95)]
-    p99 = sorted(times)[int(len(times) * 0.99)]
+    # Nearest-rank percentiles use one-based ranks. With 20 samples, p95
+    # is the 19th value; indexing at 19 incorrectly reports the maximum.
+    ordered = sorted(times)
+    p95 = ordered[ceil(len(times) * 0.95) - 1]
+    p99 = ordered[ceil(len(times) * 0.99) - 1]
     print(f"  {name}: p50={p50:.2f}ms, p95={p95:.2f}ms, p99={p99:.2f}ms (budget={budget_ms}ms)")
     assert p95 < budget_ms, f"{name} p95={p95:.2f}ms exceeds budget {budget_ms}ms"
 

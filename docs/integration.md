@@ -1,524 +1,163 @@
 # Integration Guide
 
-Qise offers three integration modes, ranging from zero-code desktop usage to developer-friendly programmatic access.
+The desktop and `qise` CLI manage the same Python product engine. Choose the path based on where you can enforce a check, then confirm that the actual agent traffic or tool invocation reaches it.
 
-## Integration Modes at a Glance
+| Path | Setup | What Qise can check |
+| --- | --- | --- |
+| Product HTTP proxy | Supported agent takeover or manual base-URL configuration | Parsed requests and responses on supported HTTP routes. |
+| MCP tools | Install the optional MCP package and register Qise manually | Content or tool calls explicitly submitted to Qise's tools. |
+| SDK/adapters | Add checks to your application or tool wrappers | The hooks and tool invocations you connect. |
 
-| Mode | Code Required | Defense Depth | Best For |
-|------|--------------|---------------|----------|
-| **Proxy Mode** | 0 lines | Runtime proxy guard pipeline | Current CLI product path |
-| **MCP Mode** | 0 lines | Partial (hard defense only) | MCP ecosystem users |
-| **SDK Mode** | 1-5 lines | Deep framework hooks | Agent developers |
+No path by itself provides an operating-system sandbox or complete coverage of every agent action.
 
----
+## Product Proxy
 
-## Mode A: Proxy Mode (Zero-Code, Recommended)
-
-Qise starts a local HTTP proxy that intercepts all traffic between the Agent and its LLM API. By parsing the OpenAI-compatible API format, it can inspect requests and responses in real-time.
-
-### How It Works
-
-```
-Agent ──API Request──▶ Qise Proxy ──Forwarded Request──▶ LLM API
-                          │                                    │
-                          │ Guard Pipeline                     │
-                          │ • Check injection in messages      │
-                          │ • Inject security context          │
-                          │ • Parse tool_use / tool_result     │
-                          │                                    │
-                       Agent ◀──Modified Response── Qise Proxy ◀──API Response──
+```text
+Agent → local Qise HTTP proxy → existing model API
+                  ↓
+          policy checks + events
 ```
 
-### Current Product Setup
-
-The desktop app and CLI share the same protection engine. Use the desktop Agent Shield for guided setup, or run the equivalent CLI commands:
+Start with a scan, then connect a supported installed agent:
 
 ```bash
+qise scan all
 qise protect codex
-qise protect openclaw
-qise status
+# Other supported choices: opencode, openclaw, claude-code
+qise status --json
 ```
 
-`qise protect` currently:
+Qise backs up the agent config, determines the upstream, changes the supported selected route, and records recovery metadata. Supply `--base-url` if upstream selection is ambiguous. OpenCode and OpenClaw selected-provider changes preserve other providers. Project-level overrides or alternative profiles may still route around the user config.
 
-1. Starts Qise-managed local services when needed.
-2. Backs up the Agent's current configuration under `~/.qise/backups/...`.
-3. Rewrites OpenAI-compatible base-url fields to `http://127.0.0.1:8822/agent/<agent>/v1`.
-4. Records Qise metadata, original endpoint, and API-key environment variable name in `~/.qise/state.json`. It does not need to copy the provider secret itself when the Agent already uses an environment variable.
-5. Restores the original config with `qise restore <agent>` or `qise restore all`.
+`configured` means recovery metadata exists; `protected` additionally requires matching config and healthy managed services. The health check identifies the expected service instance instead of trusting any process on the port. See [status and recovery](protection-upgrade.md).
 
-### Protect Flow (inspired by cc-switch)
+### Manual Clients and WorkBuddy
 
-```
-Before:
-  Agent config → env_key: "OPENAI_API_KEY" → endpoint: "https://api.example.com/v1"
-
-After protect:
-  Agent config → env_key: "OPENAI_API_KEY" → endpoint: "http://127.0.0.1:8822/agent/codex/v1"
-  Qise state  → original_endpoint = "https://api.example.com/v1"
-
-After restore:
-  Agent config → env_key: "OPENAI_API_KEY" → endpoint: "https://api.example.com/v1"
-```
-
-### What the Proxy Inspects
-
-| API Event | Proxy Action | Guards Triggered |
-|-----------|-------------|-----------------|
-| Request with `messages` | Check user_input for injection | PromptGuard |
-| Request with `tools` | Check tool descriptions for poisoning | ToolSanityGuard |
-| Response with `tool_use` | Check tool call arguments | CommandGuard, FilesystemGuard, NetworkGuard, ExfilGuard |
-| Response with reasoning | Analyze chain of thought | ReasoningGuard |
-| Request with `tool_result` | Check tool output for injection | PromptGuard |
-| Response with text | Check for credential/KB leaks | CredentialGuard, OutputGuard |
-| Any request | Inject security context into system message | SecurityContextProvider |
-
-### Guard Decision → Proxy Action
-
-| Guard Verdict | Proxy Action |
-|---------------|-------------|
-| PASS | Forward request/response unchanged |
-| WARN | Add warning header, forward unchanged |
-| BLOCK | Return error response to Agent, don't forward |
-| ESCALATE | Pause, invoke LLM deep analysis, then decide |
-
-### SSE Streaming Support
-
-For agents using streaming responses (SSE), the proxy:
-1. Buffers the streaming response incrementally
-2. Analyzes tool_use calls as they appear in the stream
-3. For text content, performs output checks on completed chunks
-4. Does NOT block streaming for text-only responses (low latency impact)
-
-### Supported Agents (Current MVP Proxy Mode)
-
-| Agent | API Format | Current support |
-|-------|-----------|-----------------|
-| Codex | OpenAI-compatible `/v1/chat/completions` | Verified via `qise protect codex` |
-| OpenClaw | OpenAI-compatible `/v1/chat/completions` | Verified via `qise protect openclaw`; config layouts may vary |
-| Custom agents | OpenAI-compatible `/v1/chat/completions` | Manual via `qise protect custom --base-url ...` or proxy config |
-| Claude Code | Anthropic-native `/v1/messages` | Verified via `qise protect claude-code`; supports native Messages request/response parsing and streaming `tool_use` checks |
-| Gemini CLI / Hermes | Depends on local configuration | Advanced/manual integration, not a release blocker |
-
-### CLI Proxy Mode
-
-For users who prefer CLI over the desktop app:
+WorkBuddy supports asset scans, not automatic takeover:
 
 ```bash
-# Recommended product path: auto-back up and patch a known Agent config
-qise protect codex
-qise protect openclaw
-qise protect claude-code --base-url https://api.anthropic.com
-
-# Custom OpenAI-compatible Agent
+qise scan agent workbuddy
 qise protect custom --base-url https://api.example.com/v1
+```
 
-# Manual proxy start for advanced users; global --config comes before the command
+Set your client's supported HTTP API base URL to the local URL printed by Qise, usually `http://127.0.0.1:8822/agent/custom/v1`. Keep the normal upstream credentials configured appropriately for that provider. A successful service start does not confirm this manual client setup, and Qise does not automatically verify the manual route.
+
+For advanced standalone proxy use, global config options precede the command:
+
+```bash
 qise --config shield.yaml proxy start --port 8822 --upstream https://api.example.com/v1
 ```
 
----
+### HTTP Protocol Coverage
 
-## Mode B: MCP Mode (Zero-Code, Limited)
+This table applies to the Python product proxy.
 
-Qise registers as an MCP server in the Agent's configuration. The Agent can call Qise's security check tools voluntarily.
+| Protocol/route | Inspected behavior | Boundary |
+| --- | --- | --- |
+| `POST /v1/chat/completions` | Supported message/tool input, response tool calls, text output, and SSE tool-call assembly. | OpenAI-compatible providers can differ in fields and streaming behavior. |
+| `POST /v1/messages` | Anthropic message/tool input, response `tool_use`, and SSE tool-call assembly. | Provider-native tools are not made local by routing through Qise. |
+| `POST /v1/responses` | Supported input items and function/custom-tool output, including SSE. | Hidden context referenced by `previous_response_id` is not fully available for inspection. |
+| `GET /v1/responses/{id}` | Retrieved supported output and SSE when requested. | Only returned content is available for checks. |
+| Other HTTP routes | May be forwarded for compatibility. | Forwarding is not a claim of guard coverage. |
+| WebSocket | Not supported by this HTTP inspection path. | Configure a supported HTTP transport or use explicit application hooks. |
 
-### Setup
+Image/audio payloads and unsupported item types are not covered by a general semantic-content inspection claim. The proxy must receive the actual request; direct upstream traffic cannot be inspected.
 
-**Desktop App**: Click "Register MCP" → Qise automatically adds itself to the Agent's MCP configuration.
+### Streaming and Execution
 
-**Manual**: Add to your Agent's MCP configuration:
+Supported client-executed tool calls are buffered until complete, validated, and checked before executable call data is delivered to the agent. Malformed/incomplete tool streams and interrupted streams do not count as successful checks or release buffered executable calls. This gate covers delivery of supported client tools, not tools that the model provider executes on its own servers.
+
+Streaming text can be forwarded before the final output audit. A later warning or block verdict cannot retract text already delivered. Do not treat post-stream credential detection as guaranteed prevention of streamed disclosure.
+
+### Policy and Decisions
+
+```bash
+qise guards --json
+qise guards --set prompt observe --json
+```
+
+The desktop uses these commands too. Mode overrides persist in `~/.qise/guard-policy.json` and product proxy/Bridge checks refresh them without restart. `enforce`, `observe`, and `off` remain the only modes; Smart Protection is a preset. Models are optional and their presence does not change modes automatically.
+
+| Effective outcome | Meaning |
+| --- | --- |
+| Pass | The checked content may proceed. |
+| Warning | Report the finding; continue under the effective policy. |
+| Block | The integration must honor `should_block`; the proxy refuses the checked request or tool call. |
+| Info | Precautionary guidance or degraded-detection notice, not a confirmed finding. |
+
+### Restore Before Stopping
+
+```bash
+qise restore all
+qise stop
+```
+
+Restore removes Qise changes while preserving unrelated edits where possible. Conflicting changes that cannot be reconciled safely produce an error and keep the current config and backup. `qise stop` also restores all configured clients before stopping services; if recovery fails, it keeps services running.
+
+## MCP Tools
+
+MCP is an optional server dependency, separate from scanning MCP config files:
+
+```bash
+pip install -e ".[mcp]"
+qise serve --transport stdio
+```
+
+Register the server in your client's MCP settings manually, using the `qise` executable from the environment where it is installed:
 
 ```json
 {
   "mcpServers": {
     "qise": {
-      "command": "python",
-      "args": ["-m", "qise.mcp_server"],
-      "env": {
-        "QISE_CONFIG": "/path/to/shield.yaml"
-      }
+      "command": "/absolute/path/to/qise",
+      "args": ["serve", "--transport", "stdio"]
     }
   }
 }
 ```
 
-### MCP Tools
+Available tools include `qise_check_tool_call`, `qise_check_content`, `qise_check_output`, and `qise_get_security_context`. They check only submitted data. Merely registering the server or asking an agent to call it does not enforce interception of other tools. The application must require the check and honor blocking results for it to serve as a gate.
 
-| Tool | Description | Parameters |
-|------|-------------|-----------|
-| `qise_check_tool_call` | Check a tool call before execution | `tool_name`, `tool_args` |
-| `qise_check_content` | Check incoming content for injection | `content`, `trust_boundary` |
-| `qise_check_output` | Check agent output for leaks | `output_text` |
-| `qise_get_security_context` | Get security context for current operation | `tool_name`, `tool_args` |
+## SDK and Adapters
 
-### MCP Limitations
-
-| Limitation | Impact | Mitigation |
-|-----------|--------|-----------|
-| No trajectory access | Can't detect multi-turn attacks | Use Proxy Mode for full coverage |
-| No reasoning access | ReasoningGuard unavailable | Use Proxy Mode for full coverage |
-| No auto-interception | Agent must voluntarily call tools | Combine with SecurityContextProvider injection via AGENTS.md |
-| No security context injection | Soft defense layer unavailable | Manually add security rules to CLAUDE.md/AGENTS.md |
-
-### Recommended MCP Usage
-
-MCP mode works best when combined with manual security context injection:
-
-1. Register Qise as MCP server (for hard defense checks)
-2. Add security context to CLAUDE.md / AGENTS.md (for soft defense)
-
-```markdown
-# Add to CLAUDE.md or AGENTS.md
-
-## Security Rules
-- Before executing any shell command, call qise_check_tool_call
-- Before processing tool results, call qise_check_content
-- Before sending output, call qise_check_output
-- Call qise_get_security_context for security guidance
-```
-
----
-
-## Mode C: SDK Mode (Code Integration)
-
-For developers who want the deepest integration and lowest latency.
-
-### Generic Python SDK
+Use the SDK when you control the application boundary. For example:
 
 ```python
 from qise import Shield
 from qise.core.models import GuardContext
 
 shield = Shield.from_config()
-
-# Check a tool call before execution
-result = shield.pipeline.run_egress(GuardContext(
-    tool_name="bash",
-    tool_args={"command": "rm -rf /tmp/*"},
-))
-
-if result.should_block:
-    print(f"Blocked: {result.blocked_by}")
-```
-
-### Adapter E2E Verification Matrix
-
-| Framework | E2E Verified | Proxy Cover | SDK Adapter Status | pip Package | Notes |
-|-----------|-------------|-------------|-------------------|-------------|-------|
-| OpenAI Agents SDK | ✅ R16 10/10 | ✅ | ✅ Real-verified | `openai-agents` | |
-| LangGraph | ✅ R19 8/8 | ✅ | ✅ Fixed & verified | `langgraph` | StructuredTool handling fixed |
-| MCP Server | ✅ R19 8/8 | N/A | ✅ Real-verified | `mcp` | 4 tools all verified |
-| Nanobot | ✅ R19 8/8 | ✅ | ✅ Fixed & verified | `nanobot-ai` | tool_results API fixed |
-| Hermes | ❌ No hooks | ✅ | ✅ Rewritten | `hermes-ai` | No plugin system; use wrap_tool or Proxy |
-| NexAU | ❌ Not installable | ✅ | Unverified | N/A | No public pip package |
-
-### Nanobot
-
-**E2E Verified**: 8/8 tests pass (`examples/nanobot_live_test.py`)
-
-```python
-from qise import Shield
-from qise.adapters.nanobot import QiseNanobotHook
-
-shield = Shield.from_config()
-hook = QiseNanobotHook(shield)
-loop = AgentLoop(hooks=[hook])
-```
-
-| Feature | Supported |
-|---------|-----------|
-| Ingress (tool result check) | Yes (after_iteration) |
-| Egress (tool call check) | Yes (before_execute_tools) |
-| Output (leak detection) | Yes (after_iteration) |
-| Security context injection | Yes (before_execute_tools) |
-| Reasoning access | Yes (via agent_reasoning) |
-
-**R19 Fix**: `after_iteration` now correctly uses `zip(context.tool_calls, context.tool_results)` to match tool names by index. Nanobot's `tool_results` are raw return values (strings/lists), not objects with `.tool_name`/`.content` attributes.
-
-### Hermes
-
-**E2E Verified**: Adapter tested with `hermes-ai` 0.3.20. No plugin/hook system found — adapter rewritten.
-
-```python
-from qise import Shield
-from qise.adapters.hermes import QiseHermesAdapter
-
-shield = Shield.from_config()
-adapter = QiseHermesAdapter(shield)
-
-# Wrap tools with security checks
-safe_bash = adapter.wrap_tool(bash)
-
-# Or check output manually
-result = adapter.check_agent_output("Agent response text")
-```
-
-| Feature | Supported |
-|---------|-----------|
-| Egress (tool call check) | Yes (wrap_tool — raises RuntimeError on block) |
-| Output (leak detection) | Yes (check_agent_output) |
-| Security context injection | — |
-| Reasoning access | — |
-
-**R19 Discovery**: Hermes-ai 0.3.20 does NOT have a plugin/hook system. The original `QiseHermesPlugin` with `register()`, `pre_tool_call`, `post_tool_call`, `transform_tool_result`, and `post_llm_call` hooks was based on incorrect API assumptions. The adapter was rewritten as `QiseHermesAdapter` with `wrap_tool()` and `check_agent_output()` methods. **Proxy mode recommended** for full protection.
-
-### NexAU
-
-**Not Installable**: No public pip package (`nexau`, `nexau-agent`, `NexAU` all return 404).
-
-```python
-from qise import Shield
-from qise.adapters.nexau import QiseNexauMiddleware
-
-shield = Shield.from_config()
-middleware = QiseNexauMiddleware(shield)
-agent = NexAUAgent(middlewares=[middleware])
-```
-
-| Feature | Supported |
-|---------|-----------|
-| Ingress (tool result check) | Yes (after_tool) — unverified |
-| Egress (tool call check) | Yes (after_model, before_tool) — unverified |
-| Output (leak detection) | Yes (after_agent) — unverified |
-| Security context injection | Yes (before_model) — unverified |
-| Reasoning access | Yes (after_model) — unverified |
-
-**Status**: Adapter code exists but has NOT been verified against a real NexAU installation. Proxy mode provides full protection for any OpenAI-compatible NexAU deployment.
-
-### LangGraph
-
-**E2E Verified**: 8/8 tests pass (`examples/langgraph_live_test.py`)
-
-```python
-from qise import Shield
-from qise.adapters.langgraph import QiseLangGraphWrapper
-
-shield = Shield.from_config()
-wrapper = QiseLangGraphWrapper(shield)
-
-# Wrap tools for ToolNode
-safe_tools = [wrapper.wrap_tool_call(tool) for tool in my_tools]
-
-# Or async version
-safe_tools = [wrapper.awrap_tool_call(tool) for tool in my_async_tools]
-
-# Add pre-model hook for SecurityContext injection
-graph.add_node("pre_model", wrapper.qise_pre_model_hook)
-```
-
-| Feature | Supported |
-|---------|-----------|
-| Ingress | — |
-| Egress (tool call check) | Yes (wrap_tool_call / awrap_tool_call) |
-| Output | — |
-| Security context injection | Yes (qise_pre_model_hook) |
-| Reasoning access | — |
-
-BLOCK strategy: raises `ToolException` (if langgraph installed) or `RuntimeError`.
-
-**R19 Fixes**:
-- `ToolException` import corrected: `from langchain_core.tools import ToolException` (not `from langgraph.tools`)
-- `wrap_tool_call` now detects `StructuredTool` (BaseTool subclass) and creates `StructuredTool.from_function()` with guarded func, preserving name/description/args_schema
-- `qise_pre_model_hook` uses `llm_input_messages` for ephemeral injection when available
-
-### OpenAI Agents SDK
-
-**E2E Verified**: R16 10/10 tests pass (`examples/openai_agents_live_test.py`)
-
-```python
-from qise import Shield
-from qise.adapters.openai_agents import QiseOpenAIAgentsGuardrails
-
-shield = Shield.from_config()
-guardrails = QiseOpenAIAgentsGuardrails(shield)
-
-agent = Agent(
-    name="my-agent",
-    guardrails=[
-        guardrails.input_guardrail,
-        guardrails.output_guardrail,
-    ],
+result = shield.check_sync(
+    GuardContext(tool_name="bash", tool_args={"command": "rm -rf /"}),
+    pipeline_kind="egress",
 )
-
-# Or wrap tools individually
-for tool in tools:
-    tool = guardrails.wrap_tool(tool)
+if result.should_block:
+    raise RuntimeError(f"Blocked by Qise: {result.blocked_by}")
+# Only invoke the real tool after accepting the result.
 ```
 
-| Feature | Supported |
-|---------|-----------|
-| Ingress (input check) | Yes (input_guardrail, tool_output_guardrail) |
-| Egress (tool call check) | Yes (tool_input_guardrail) |
-| Output (leak detection) | Yes (output_guardrail) |
-| Security context injection | — |
-| Reasoning access | — |
+Inspect the current integration snippets rather than assuming all frameworks share a hook API:
 
-BLOCK strategy: returns `GuardrailFunctionOutput(tripwire_triggered=True)`.
-
-### Custom Adapter
-
-All adapters inherit from `AgentAdapter` and use `IngressCheckMixin` / `EgressCheckMixin`:
-
-```python
-from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin
-
-class MyFrameworkAdapter(AgentAdapter, IngressCheckMixin, EgressCheckMixin):
-
-    def __init__(self, shield):
-        super().__init__(shield)
-
-    def install(self):
-        """Register your hooks here."""
-        pass
-
-    def uninstall(self):
-        """Remove your hooks here."""
-        pass
-
-    # IngressCheckMixin provides:
-    #   check_user_input(content, trust_boundary, session_id)
-    #   check_tool_result(content, tool_name, session_id)
-
-    # EgressCheckMixin provides:
-    #   check_tool_call(tool_name, tool_args, session_id, **kwargs)
-    #   check_output(text, session_id)
-    #   _get_security_rules(tool_name, tool_args)
+```bash
+qise adapters
+qise adapters langgraph
+qise adapters openai-agents
+qise adapters nanobot
+qise adapters hermes
+qise adapters nexau
 ```
 
----
+Adapters cover only installed hooks or wrapped tools. Framework packages and real-provider examples are optional; local mock regressions do not prove compatibility with every released framework version. An independent SDK `Shield` uses its own configuration rather than automatically adopting product CLI policy overrides.
 
-## Adapter Architecture
+## Verification
 
-All 5 adapters share a common base:
+Run the normal offline regression suite with development dependencies:
 
-```
-AgentAdapter (ABC)
-├── install() / uninstall()
-│
-├── IngressCheckMixin
-│   ├── check_user_input()  → Ingress pipeline
-│   └── check_tool_result() → Ingress pipeline
-│
-└── EgressCheckMixin
-    ├── check_tool_call()   → Egress pipeline (auto-fills active_security_rules)
-    └── check_output()      → Output pipeline
+```bash
+pip install -e ".[dev,proxy]"
+pytest tests
 ```
 
-Each adapter maps framework-specific hooks to these mixin methods. No monkey-patching — only official Hook/Plugin/Middleware APIs.
-```
+Model-dependent checks may skip without their optional prerequisites. `scripts/e2e_tauri_test.py` is a live CLI/service smoke test, not an automated GUI test. Set `QISE_E2E_MODEL` and, for an authenticated upstream, `QISE_E2E_API_KEY`; SLM checks are explicitly opt-in. See its `--help` before running it against a provider.
 
----
-
-## Desktop App Integration
-
-The Qise desktop app manages all three modes through a visual interface:
-
-### System Tray
-
-| Action | What It Does |
-|--------|-------------|
-| Toggle Protection | Enable/disable proxy mode for selected agents |
-| View Status | Current protection state, blocked event count |
-| Switch Mode | observe / enforce / off for quick switching |
-| Quick Settings | SLM on/off, key guard toggles |
-
-### Proxy Panel
-
-- Select which agents to protect (Claude Code, Codex, Gemini CLI, etc.)
-- Configure proxy port and API forwarding
-- View real-time intercepted requests and guard decisions
-- Manual takeover/release for each agent
-
-### MCP Panel
-
-- Auto-register/unregister Qise to agent MCP configs
-- View which agents have Qise MCP enabled
-- Configure MCP tool permissions
-
-### Policy Editor
-
-- Visual toggle for each guard (observe/enforce/off)
-- Threshold sliders for AI-first guards
-- YAML threat pattern editor with syntax highlighting
-- Security context DSL template management
-- Import/export policies
-
----
-
-## Configuration Reference
-
-### shield.yaml
-
-```yaml
-version: "1.0"
-
-# Integration mode
-integration:
-  mode: proxy  # proxy | mcp | sdk
-  proxy:
-    port: 8822
-    target_agents:
-      - claude_code
-      - codex
-    auto_takeover: true
-    crash_recovery: true
-  mcp:
-    auto_register: true
-
-# Model configuration
-models:
-  slm:
-    base_url: "http://localhost:8822/v1"
-    model: "AgentDoG-Qwen3-4B"
-    timeout_ms: 200
-  llm:
-    base_url: "https://api.anthropic.com"
-    model: "claude-sonnet-4-5"
-    timeout_ms: 5000
-  embedding:
-    base_url: "http://localhost:8822/v1"
-    model: "text-embedding-3-small"
-
-# Guard configuration
-guards:
-  enabled:
-    - prompt
-    - command
-    - reasoning
-  config:
-    prompt:
-      mode: observe
-      slm_confidence_threshold: 0.7
-    command:
-      mode: enforce
-    reasoning:
-      mode: observe
-      threshold_adjustment_factor: 0.3
-
-# Data paths
-data:
-  threat_patterns_dir: "./data/threat_patterns"
-  security_contexts_dir: "./data/security_contexts"
-  baselines_dir: "./data/baselines"
-
-# Logging
-logging:
-  level: INFO
-  format: json
-  output: stderr
-```
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `QISE_CONFIG` | Path to shield.yaml | `./shield.yaml` |
-| `QISE_INTEGRATION_MODE` | Integration mode override | From config |
-| `QISE_PROXY_PORT` | Proxy server port | 8822 |
-| `QISE_SLM_BASE_URL` | SLM API endpoint | From config |
-| `QISE_SLM_MODEL` | SLM model name | From config |
-| `QISE_LLM_BASE_URL` | LLM API endpoint | From config |
-| `QISE_LLM_MODEL` | LLM model name | From config |
-| `QISE_LOG_LEVEL` | Log level | From config |
-| `QISE_MODE` | Global guard mode override | From config |
+Review [evaluation methodology](../eval/README.md) before interpreting detection or blocking scores. Historical E2E counts and evaluation reports are not a current compatibility guarantee.

@@ -15,18 +15,10 @@ Usage:
     shield = Shield.from_config()
     guardrails = QiseOpenAIAgentsGuardrails(shield)
 
-    # Register with OpenAI Agent
-    agent = Agent(
-        name="my-agent",
-        guardrails=[
-            guardrails.input_guardrail,
-            guardrails.output_guardrail,
-        ],
-    )
+    # Wrap a callable before registering it as an SDK function tool.
+    from agents import function_tool
+    safe_tool = function_tool(guardrails.wrap_tool(my_tool))
 
-    # Wrap tools with tool guardrails
-    for tool in tools:
-        tool.on_invoke = guardrails.wrap_tool(tool)
 """
 
 from __future__ import annotations
@@ -34,7 +26,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from qise.adapters.base import AgentAdapter, EgressCheckMixin, IngressCheckMixin
+from qise.adapters.base import (
+    AgentAdapter,
+    EgressCheckMixin,
+    IngressCheckMixin,
+    blocked_message,
+    tool_arguments,
+)
 from qise.core.shield import Shield
 
 logger = logging.getLogger("qise.adapters.openai_agents")
@@ -216,70 +214,37 @@ class QiseOpenAIAgentsGuardrails(AgentAdapter, IngressCheckMixin, EgressCheckMix
     # ------------------------------------------------------------------
 
     def wrap_tool(self, tool: Any) -> Any:
-        """Wrap a tool with input/output guardrails.
+        """Wrap the original callable before passing it to SDK function_tool.
 
-        Args:
-            tool: The original tool (function or BaseTool instance).
-
-        Returns:
-            The same tool with guardrail checks applied.
+        SDK tool instances have their own invocation contracts; accepting an
+        unknown object here would silently leave it unprotected. This wrapper
+        does not mutate framework internals or assume an on_invoke hook.
         """
-        original_invoke = getattr(tool, "on_invoke", None)
+        import functools
+        import inspect
 
-        if original_invoke is None:
-            # If the tool is a plain function, return a wrapped function
-            if callable(tool):
-                import functools
+        if not callable(tool) or hasattr(tool, "on_invoke_tool") or hasattr(tool, "on_invoke"):
+            raise TypeError(
+                "Wrap the original callable with wrap_tool before registering it as an SDK tool."
+            )
 
-                @functools.wraps(tool)
-                async def wrapped_invoke(*args: Any, **kwargs: Any) -> Any:
-                    tool_name = getattr(tool, "name", None) or tool.__name__
-                    result = self.check_tool_call(
-                        tool_name=tool_name,
-                        tool_args=kwargs if kwargs else {"args": str(args)},
-                        session_id=self.session_id,
-                    )
-                    if result.should_block:
-                        raise RuntimeError(f"Qise blocked: {result.blocked_by}")
-
-                    output = tool(*args, **kwargs)
-                    if hasattr(output, "__await__"):
-                        output = await output
-
-                    # Check tool result
-                    self.check_tool_result(
-                        content=str(output),
-                        tool_name=tool_name,
-                        session_id=self.session_id,
-                    )
-                    return output
-
-                return wrapped_invoke
-            return tool
-
-        # Wrap on_invoke method
-        async def guarded_invoke(ctx: Any, *args: Any, **kwargs: Any) -> Any:
-            tool_name = getattr(tool, "name", "") or "unknown"
+        @functools.wraps(tool)
+        async def wrapped_invoke(*args: Any, **kwargs: Any) -> Any:
+            tool_name = getattr(tool, "name", None) or tool.__name__
             result = self.check_tool_call(
                 tool_name=tool_name,
-                tool_args=kwargs if kwargs else {"args": str(args)},
+                tool_args=tool_arguments(tool, args, kwargs),
                 session_id=self.session_id,
             )
             if result.should_block:
-                raise RuntimeError(f"Qise blocked: {result.blocked_by}")
+                raise RuntimeError(blocked_message(result))
 
-            output = await original_invoke(ctx, *args, **kwargs)
+            output = tool(*args, **kwargs)
+            if inspect.isawaitable(output):
+                output = await output
+            return self.protect_tool_result(output, tool_name, self.session_id)
 
-            # Check tool result
-            self.check_tool_result(
-                content=str(output),
-                tool_name=tool_name,
-                session_id=self.session_id,
-            )
-            return output
-
-        tool.on_invoke = guarded_invoke
-        return tool
+        return wrapped_invoke
 
     # ------------------------------------------------------------------
     # Helpers

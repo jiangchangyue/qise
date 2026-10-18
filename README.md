@@ -6,7 +6,7 @@
 
 **Local-First Security for AI Agents.**
 
-Qise helps you use agents such as Codex, OpenClaw, Claude Code, and custom agents with a local safety layer. It can scan risky integrations, route model traffic through a guard proxy, block dangerous actions, and show a readable local event trail.
+Qise helps you use agents such as Codex, OpenClaw, Claude Code, OpenCode, and custom agents with a local safety layer. It can scan risky integrations, route model traffic through a guard proxy, block dangerous actions, and show a readable local event trail.
 
 [中文](./README_CN.md) | [Quickstart](./docs/quickstart.md) | [Install](./docs/install.md) | [Architecture](./docs/architecture.md) | [Privacy](./docs/privacy.md)
 
@@ -26,7 +26,9 @@ Qise has three entry points:
 | A terminal/CLI user | `qise` CLI | Run scans, protect agents, inspect events, and automate checks from scripts. |
 | An agent developer | SDK / adapters | Add Qise checks inside LangGraph, OpenAI Agents SDK, Nanobot, Hermes, or NexAU. |
 
-The desktop app and CLI use the same Python Qise product engine. The UI is not a separate implementation, so protection behavior stays aligned across both interfaces.
+The desktop app and CLI use the same Python Qise product engine. Start with **Safety Check**, then connect a supported agent through **Smart Protection**. **Enhanced Detection** is optional: scans, deterministic rules, events, and configuration recovery work without Ollama, a model download, or a GPU.
+
+Smart Protection is a preset, not a fourth guard mode. It enforces the default command, filesystem, network, credential, and tool-policy rules while semantic guards observe by default. Adding a model does not automatically turn every warning into a block. See [protection behavior and upgrade notes](./docs/protection-upgrade.md).
 
 ## What Qise Does
 
@@ -46,10 +48,10 @@ AI Agent -> Qise local proxy -> your existing model API
 
 Qise can:
 
-- Detect supported agents such as Codex, OpenClaw, and Claude Code.
+- Detect supported agents such as Codex, OpenClaw, Claude Code, and OpenCode; scan WorkBuddy assets and guide manual connection.
 - Back up an agent config before changing it.
 - Route the agent through a local guard proxy.
-- Check tool calls before they reach your system.
+- Check supported client-executed tool calls before the proxy delivers them to the agent.
 - Block dangerous commands such as destructive shell operations.
 - Warn about suspicious file, network, credential, and exfiltration behavior.
 - Scan skills, MCP configs, and agent configs before you trust them.
@@ -65,13 +67,15 @@ Qise is local-first. Product state, backups, and events are stored under `~/.qis
 
 ## Current Status
 
-Qise is currently an alpha/MVP project. Stable desktop builds are distributed through GitHub Releases for Windows x64 and macOS Apple Silicon. Tauri updater artifacts are signed, but Windows Authenticode signing and Apple Developer ID notarization are still future release-hardening work.
+Qise is currently an alpha/MVP project. Desktop builds are distributed through GitHub Releases for Windows x64 and macOS Apple Silicon. Tauri updater artifacts are signed, but Windows Authenticode signing and Apple Developer ID notarization are still future release-hardening work.
+
+This repository is a fork of [WhitzardAgent/Qise](https://github.com/WhitzardAgent/qise). Its desktop releases and automatic updates are distributed independently through [jiangchangyue/qise](https://github.com/jiangchangyue/qise/releases).
 
 | Area | What works now | Status |
 | --- | --- | --- |
 | Desktop app | Tauri 2 + React UI over the same Qise CLI/product engine | Source-build MVP |
 | CLI | `doctor`, `status`, `agents`, `scan`, `check`, `events`, `protect`, `restore`, `stop`, `slm`, `run` | Active MVP |
-| Proxy protection | OpenAI-compatible `/v1/chat/completions` and Anthropic `/v1/messages` local proxy | Active MVP |
+| Proxy protection | HTTP Chat Completions, Responses, and Anthropic Messages; see the [protocol boundaries](./docs/integration.md#http-protocol-coverage) | Active MVP |
 | Claude Code | Native Anthropic Messages proxy with request/response parsing, security-context injection, and streaming `tool_use` checks | Active MVP |
 | Preflight scan | Skill, MCP config, agent config, and detected agent asset scanning | Active MVP |
 | Guard engine | 14 guard categories across ingress, egress, and output pipelines | Active MVP |
@@ -86,7 +90,7 @@ The desktop app is the easiest way to try Qise as a product. It gives you pages 
 
 ### Option A: Install A Prebuilt App From GitHub Releases
 
-Open the [latest Qise release](https://github.com/WhitzardAgent/qise/releases/latest) and download:
+Open the [latest Qise release](https://github.com/jiangchangyue/qise/releases/latest) and download:
 
 ```text
 macOS Apple Silicon: Qise_*_aarch64.dmg
@@ -109,14 +113,14 @@ On Windows:
 
 The Windows test installer is not signed yet, so Windows SmartScreen may show an unknown-publisher warning.
 
-This Qise 0.2.0 build is the first updater-enabled build. Users who installed an earlier 0.2.0 build must install this build manually once because automatic updates require a higher version number. Later stable releases are checked after startup and installed automatically when Qise is not protecting an Agent. If protection is active, Qise defers the update until a later safe startup. Update status and manual checking are available under `Settings -> Application Update`.
+This fork uses its own update channel and updater signing key. If you installed an upstream build, manually install this fork's Qise 0.2.1 once; the upstream app will not automatically switch to this repository. After that, Qise checks this repository for newer stable releases after startup. Automatic installation is deferred while protection state is unknown or an agent still has a Qise connection configured, including when its service has stopped. Update status and manual checking are available under `Settings -> Application Update`.
 
 ### Option B: Build The macOS App From Source
 
 Run these commands from a terminal:
 
 ```bash
-git clone https://github.com/WhitzardAgent/qise.git
+git clone https://github.com/jiangchangyue/qise.git
 cd qise
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -143,14 +147,14 @@ After a successful build, the important files are:
 
 ```text
 src-tauri/target/release/bundle/macos/Qise.app
-src-tauri/target/release/bundle/dmg/Qise_0.2.0_aarch64.dmg
+src-tauri/target/release/bundle/dmg/Qise_0.2.1_aarch64.dmg
 ```
 
 The exact DMG suffix can vary by version and CPU architecture. On Apple Silicon, it is commonly `aarch64`.
 
 To install the locally built app:
 
-1. Open `src-tauri/target/release/bundle/dmg/Qise_0.2.0_aarch64.dmg`.
+1. Open `src-tauri/target/release/bundle/dmg/Qise_0.2.1_aarch64.dmg`.
 2. Drag `Qise.app` into `Applications`.
 3. Open `Qise.app`.
 
@@ -167,16 +171,31 @@ npm --prefix src-ui install
 src-ui/node_modules/.bin/tauri dev
 ```
 
+### Preview The UI In A Browser
+
+For design review, run the existing React pages without Tauri, the Python backend, proxy services, or a model:
+
+```bash
+npm --prefix src-ui ci # Skip if frontend dependencies are already installed
+npm --prefix src-ui run dev:browser
+```
+
+Open http://127.0.0.1:1420. In a remote SSH / Cursor / VS Code workspace, forward port `1420` in the Ports panel and open its forwarded URL. Use the top-right language button to switch between English and Chinese.
+
+The preview banner identifies sample agents, rules, events, configuration, and diagnostics held in memory. Browse all pages, filter events, and edit forms; real operations such as scanning, enabling protection, and saving configuration are not executed. Refresh to reset the preview. Normal `dev`, `build`, and Tauri workflows continue to use the native APIs.
+
+For a static preview build, run `npm --prefix src-ui run build:browser`, then `npm --prefix src-ui run preview -- --host 127.0.0.1`. Run the normal `build` before packaging the desktop app.
+
 ## First Use In The Desktop App
 
-1. Open `Qise.app`.
-2. Click `Detect Agents` on the home page.
-3. Go to `Agent Shield`.
-4. Choose an agent such as Codex, OpenClaw, or Claude Code.
-5. Check the upstream model API URL.
-6. Click `Protect`.
-7. Use your agent normally.
-8. Return to Qise and open `Security Events` to see warnings and blocks.
+1. Open Qise and click **Run Safety Check** on the home page.
+2. Review the findings for agent configuration, skills, and MCP assets.
+3. Open **Smart Protection** and choose a supported agent.
+4. Check the upstream model API URL, then click **Protect**.
+5. Confirm that the agent is shown as protected, then use it normally.
+6. Read warnings and blocks in **Security Events**. Enable **Enhanced Detection** only if you want model review.
+
+A scan is a point-in-time configuration review; it does not turn on runtime protection. A service being ready also does not prove that an agent uses it. An existing connection can be marked **Needs attention** when services stop or its configuration no longer matches; **Restore** remains available in that state.
 
 For Claude Code, keep your Anthropic key available in the environment:
 
@@ -199,10 +218,10 @@ qise stop
 
 ## Install The CLI From Source
 
-If you prefer the terminal, install Qise as a Python package:
+If you prefer the terminal, install Qise as a Python package. The base package has no model runtime or MCP server dependency; `[proxy]` adds optional config watching:
 
 ```bash
-git clone https://github.com/WhitzardAgent/qise.git
+git clone https://github.com/jiangchangyue/qise.git
 cd qise
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -220,6 +239,8 @@ qise doctor # Checks Python, Qise import, config, local ports, event log, option
 | `source .venv/bin/activate` | Activates that environment. |
 | `pip install -e ".[proxy]"` | Installs Qise in editable mode with proxy runtime dependencies. |
 | `qise doctor` | Checks Python, Qise import, config, local ports, event log, optional SLM, and detected agents. | -->
+
+To serve Qise tools through MCP, install the separate extra: `pip install -e ".[mcp]"`. Scanning MCP configuration files does not require this extra.
 
 For development and tests:
 
@@ -308,6 +329,25 @@ If Qise cannot infer the upstream provider:
 qise protect codex --base-url https://api.openai.com/v1
 ```
 
+Protect OpenCode's selected provider:
+
+```bash
+qise protect opencode
+# If the upstream cannot be inferred:
+qise protect opencode --base-url https://api.example.com/v1
+```
+
+Only the selected provider in the detected global JSON/JSONC configuration is changed. Other providers are preserved. Project configuration can override global settings; verify the actual route used by that project.
+
+WorkBuddy currently supports scanning and manual custom-model connection:
+
+```bash
+qise scan agent workbuddy
+qise protect custom --base-url https://api.example.com/v1
+```
+
+Then enter the printed Qise URL in WorkBuddy's custom model settings. `qise protect workbuddy` does not modify its configuration, and built-in model traffic or a manual connection is not automatically verified as protected.
+
 Protect OpenClaw:
 
 ```bash
@@ -342,7 +382,9 @@ For a custom agent, Qise starts the proxy and prints the local proxy URL. Point 
 http://127.0.0.1:8822/v1
 ```
 
-Restore and stop:
+Restoring removes Qise's configuration changes while preserving unrelated settings edited afterward where the format permits. If a conflicting edited Qise provider block cannot be safely restored, the command fails without overwriting it; inspect the retained backup. Backups are kept after restore.
+
+`qise stop` restores all configured agents before stopping services. If recovery fails, services keep running so remaining clients retain their connection. You can also restore a connection explicitly before stopping or uninstalling:
 
 ```bash
 qise restore codex
@@ -360,7 +402,7 @@ qise stop
 | `qise agents` | Detect supported installed agents. |
 | `qise protect <agent>` | Back up and route an agent through Qise. |
 | `qise restore <agent|all>` | Restore agent config modified by Qise. |
-| `qise stop` | Stop Qise-managed background services. |
+| `qise stop` | Restore configured agents, then stop managed services; keep services running if recovery fails. |
 | `qise scan all` | Scan detected agent assets automatically. |
 | `qise scan agent <agent>` | Scan one agent's config, skill files, and MCP candidates. |
 | `qise scan skill <path>` | Scan a skill directory or file. |
@@ -370,10 +412,11 @@ qise stop
 | `qise events` | Read local security events. |
 | `qise slm start/status/stop` | Configure or disable the optional local SLM review layer. |
 | `qise run --agent <name> -- <cmd>` | Run a command under the Runtime Observer. |
-| `qise guards` | List registered guards, pipelines, strategies, and modes. |
+| `qise guards --json` | Read the effective, deduplicated guard policy. |
+| `qise guards --set prompt observe --json` | Persist a guard mode shared by the CLI, proxy, bridge, and desktop. |
 | `qise context <tool>` | Preview security context text for a tool. |
 | `qise proxy start` | Start the local OpenAI-compatible/Anthropic proxy manually. |
-| `qise bridge start` | Start the local bridge used by desktop/guard control flows. |
+| `qise bridge start` | Start the local bridge for guard integration. Desktop policy changes use the CLI. |
 | `qise serve --transport stdio` | Start Qise as an MCP server. |
 | `qise adapters <name>` | Print SDK integration snippets for supported frameworks. |
 
@@ -406,13 +449,23 @@ The current guard set includes:
 | `output` | Review final output for sensitive or risky content. |
 | `reasoning` | Optional semantic review of model/tool reasoning signals when available. |
 
-Rules-first guards with low false-positive risk default to `enforce`. AI-first guards default to `observe` unless you enable and tune the local SLM layer.
+Smart Protection defaults `command`, `filesystem`, `network`, `credential`, and `tool_policy` to `enforce`; the remaining guards default to `observe`. Model setup and enforcement mode are independent choices.
+
+Read or change the same effective policy from the desktop or CLI:
+
+```bash
+qise guards --json
+qise guards --set prompt observe --json
+qise guards --set command enforce --json
+```
+
+Overrides are saved in `~/.qise/guard-policy.json` (or `QISE_HOME`) and applied by product proxy/bridge checks without a restart. `observe` records warnings, `enforce` permits blocking, and `off` skips the guard. Standalone SDK Shields retain their own configuration.
 
 ## Optional Local SLM
 
-Qise works in rule-only mode by default. The SLM layer adds semantic review for cases that are hard to catch with simple rules.
+Qise starts without a configured SLM. The default installation and first-run scan do not download a model. The optional SLM layer adds semantic review for cases that are hard to catch with simple rules.
 
-Start the default local SLM setup:
+Explicitly start local SLM setup when you want it:
 
 ```bash
 qise slm start
@@ -439,12 +492,15 @@ Disable the Qise SLM config:
 qise slm stop
 ```
 
-If Qise proxy/protection was already running, restart protection after changing SLM state:
+If Qise proxy/protection was already running, restore and restart the connection after changing SLM endpoint settings:
 
 ```bash
+qise restore codex
 qise stop
 qise protect codex
 ```
+
+Guard mode changes through `qise guards --set` do not require this restart.
 
 ## SDK And Framework Adapters
 
@@ -548,6 +604,7 @@ By default:
 
 ```text
 ~/.qise/state.json       # current services, protected agents, SLM state
+~/.qise/guard-policy.json # persisted guard-mode overrides
 ~/.qise/events.jsonl     # local security events
 ~/.qise/backups/         # agent config backups before patching
 ~/.qise/logs/            # managed proxy/bridge stdout and stderr logs
@@ -618,14 +675,17 @@ qise events --limit 5
 
 ## Current Limitations
 
-- The macOS and Windows installers in this repository are currently unsigned test builds.
-- Proxy mode currently targets OpenAI-compatible chat/completions traffic and Anthropic Messages `/v1/messages` traffic.
+- The macOS app is ad-hoc signed without Apple Developer ID notarization, and the Windows installer lacks Authenticode signing. Updater artifacts are signed separately with this fork's updater key.
+- HTTP proxy coverage includes Chat Completions, Anthropic Messages, and supported Responses text/function/custom-tool flows. WebSocket, upstream-hosted tool execution, and unrecognized API routes are outside the execution gate. Streamed text is audited after delivery; see [protocol boundaries](./docs/integration.md#http-protocol-coverage).
+- Healthy service identity and matching configuration do not prove complete agent execution coverage. Project overrides, built-in model paths, and calls that bypass Qise remain outside the proxy.
+- Historical benchmark reports use older metric/mode behavior. Use the corrected [evaluation runner](./eval/README.md); detection F1 is not a blocking-success rate.
 - Runtime Observer is a user-space wrapper, not OS/kernel-level auditing.
 - Local SLM quality and latency depend on the model and server you choose.
 - The Windows EXE is produced by a GitHub Actions Windows runner and cannot be installation-tested directly on macOS.
 
 ## Learn More
 
+- [Protection behavior and upgrade notes](./docs/protection-upgrade.md)
 - [Install](./docs/install.md)
 - [Quickstart](./docs/quickstart.md)
 - [Architecture](./docs/architecture.md)

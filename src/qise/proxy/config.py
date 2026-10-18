@@ -38,7 +38,7 @@ class ProxyConfig(BaseModel):
         default_factory=lambda: ["/v1/models"],
     )
     intercept_paths: list[str] = Field(
-        default_factory=lambda: ["/v1/chat/completions", "/v1/messages"],
+        default_factory=lambda: ["/v1/chat/completions", "/v1/messages", "/v1/responses"],
     )
     request_timeout_s: float = 120.0
     max_request_body_mb: float = 50.0
@@ -79,21 +79,9 @@ class ProxyConfig(BaseModel):
             self.inject_security_context = val.lower() in ("true", "1", "yes")
         if val := os.getenv("QISE_PROXY_BLOCK_ON_GUARD"):
             self.block_on_guard_block = val.lower() in ("true", "1", "yes")
-        if val := os.getenv("OPENAI_API_BASE"):
-            # Auto-detect upstream from OPENAI_API_BASE
-            if not self.upstream_base_url:
-                self.upstream_base_url = val.rstrip("/")
-        if val := os.getenv("OPENAI_API_KEY"):
-            # Auto-detect upstream API key
-            if not self.upstream_api_key:
-                self.upstream_api_key = val
-        if val := os.getenv("ANTHROPIC_BASE_URL"):
-            # Auto-detect Anthropic upstream for Claude Code and native clients.
-            if not self.upstream_base_url:
-                self.upstream_base_url = val.rstrip("/")
-        if val := os.getenv("ANTHROPIC_API_KEY"):
-            if not self.upstream_api_key:
-                self.upstream_api_key = val
-        if val := os.getenv("ANTHROPIC_AUTH_TOKEN"):
-            if not self.upstream_api_key:
-                self.upstream_api_key = val
+        if not self.upstream_base_url:
+            self.upstream_base_url = (os.getenv("OPENAI_API_BASE") or os.getenv("ANTHROPIC_BASE_URL") or "").rstrip("/")
+        if not self.upstream_api_key:
+            self.upstream_api_key = (
+                os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN") or ""
+            )

@@ -175,6 +175,7 @@ class PromptGuardRuleChecker(RuleChecker):
                 verdict=GuardVerdict.WARN,
                 confidence=0.6,
                 message=f"Content from {context.trust_boundary} (trust level: {level.name}) requires isolation",
+                evidence_kind="precaution",
                 risk_attribution=RiskAttribution(
                     risk_source="indirect_injection",
                     failure_mode="unauthorized_action",
@@ -202,6 +203,7 @@ class PromptGuardRuleChecker(RuleChecker):
                 verdict=GuardVerdict.WARN,
                 confidence=0.5,
                 message=f"Models unavailable; content from {context.trust_boundary} isolated as precaution",
+                evidence_kind="precaution",
                 transformed_args=self._add_banners(context, banners),
             )
         return GuardResult(
@@ -209,6 +211,7 @@ class PromptGuardRuleChecker(RuleChecker):
             verdict=GuardVerdict.WARN,
             confidence=0.3,
             message="Models unavailable; applying safe defaults",
+            evidence_kind="degraded",
         )
 
     def _extract_content(self, context: GuardContext) -> str:

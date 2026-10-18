@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections import deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, Field
 
+from qise.product.privacy import redact_evidence, redact_text
 from qise.product.service import ensure_qise_home, events_path, load_state, now_iso
 
 SCHEMA_VERSION = "0.1"
@@ -81,6 +83,7 @@ class EventEvidence(BaseModel):
     verdict: str = ""
     risk_source: str = ""
     confidence: float | None = None
+    evidence_kind: str = "finding"
 
 
 class SecurityEvent(BaseModel):
@@ -134,11 +137,12 @@ def parse_since(value: str | None) -> datetime | None:
 def _safe_snippet(value: Any, *, max_len: int = 240) -> str:
     if value is None:
         return ""
+    value = redact_evidence(value)
     try:
         raw = value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
     except Exception:
         raw = str(value)
-    raw = " ".join(raw.split())
+    raw = redact_text(" ".join(raw.split()))
     if len(raw) <= max_len:
         return raw
     return raw[: max_len - 3] + "..."
@@ -234,6 +238,13 @@ def guard_event_from_results(
     """
     results = guard_results or []
     normalized_verdict = "block" if verdict == "block" else "warn"
+    notices = [result for result in results if isinstance(result, dict) and str(result.get("verdict", "pass")).lower() != "pass"]
+    informational = normalized_verdict == "warn" and bool(notices) and all(
+        result.get("verdict") == "warn" and result.get("evidence_kind") in {"precaution", "degraded"}
+        for result in notices
+    )
+    if informational:
+        normalized_verdict = "info"
     category = blocked_by or _category_from_results(results, "guard")
     evidence: list[dict[str, Any]] = []
     for result in results:
@@ -248,6 +259,7 @@ def guard_event_from_results(
             "message": _safe_snippet(result.get("message", "")),
             "risk_source": str(result.get("risk_source", "")),
             "confidence": result.get("confidence"),
+            "evidence_kind": str(result.get("evidence_kind", "finding")),
         })
     for warning in warnings or []:
         evidence.append({
@@ -263,6 +275,8 @@ def guard_event_from_results(
         })
     if not recommendation:
         recommendation = (
+            "Protection notice: review detection availability or content isolation details. No specific threat was identified."
+            if informational else
             "Qise blocked this action. Review the evidence before retrying or relaxing guard mode."
             if normalized_verdict == "block"
             else "Qise observed suspicious behavior. Review the evidence before continuing."
@@ -272,8 +286,8 @@ def guard_event_from_results(
         stage=stage,
         source=source,
         verdict=normalized_verdict,
-        category=category,
-        severity="high" if normalized_verdict == "block" else "medium",
+        category="Protection Notice" if informational else category,
+        severity="info" if informational else "high" if normalized_verdict == "block" else "medium",
         confidence=_confidence_from_results(results, 1.0 if normalized_verdict == "block" else 0.6),
         action_type=action_type,
         action_name=action_name,
@@ -442,41 +456,44 @@ def _runtime_suspicious(command: list[str], process_tree: list[dict[str, Any]], 
 
 def append_event(event: dict[str, Any]) -> Path:
     ensure_qise_home()
-    normalized = SecurityEvent.model_validate(event).model_dump(mode="json")
+    normalized = SecurityEvent.model_validate(redact_evidence(event)).model_dump(mode="json")
     path = events_path()
-    with path.open("a", encoding="utf-8") as f:
+    import os
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
         f.write(json.dumps(normalized, sort_keys=True) + "\n")
     return path
 
 
-def load_events(*, limit: int = 50, since: str | None = None, stage: str | None = None) -> list[dict[str, Any]]:
+def _iter_events(*, since: str | None = None, stage: str | None = None):
     path = events_path()
     if not path.exists():
-        return []
+        return
 
     since_dt = parse_since(since)
-    events: list[dict[str, Any]] = []
-    for line in path.read_text().splitlines():
-        if not line.strip():
-            continue
-        try:
-            event = SecurityEvent.model_validate(json.loads(line)).model_dump(mode="json")
-        except Exception:
-            continue
-        if since_dt is not None:
-            ts = _parse_timestamp(str(event.get("timestamp", "")))
-            if ts is None or ts < since_dt:
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            if not line.strip():
                 continue
-        if stage and str(event.get("stage", "")).lower() != stage.lower():
-            continue
-        events.append(event)
-    if limit > 0:
-        events = events[-limit:]
-    return events
+            try:
+                event = SecurityEvent.model_validate(redact_evidence(json.loads(line))).model_dump(mode="json")
+            except Exception:
+                continue
+            if since_dt is not None:
+                ts = _parse_timestamp(str(event.get("timestamp", "")))
+                if ts is None or ts < since_dt:
+                    continue
+            if stage and str(event.get("stage", "")).lower() != stage.lower():
+                continue
+            yield event
+
+
+def load_events(*, limit: int = 50, since: str | None = None, stage: str | None = None) -> list[dict[str, Any]]:
+    return list(deque(_iter_events(since=since, stage=stage), maxlen=limit if limit > 0 else None))
 
 
 def count_recent_events(hours: int = 24) -> tuple[int, int]:
-    events = load_events(limit=0, since=f"{hours}h")
+    events = _iter_events(since=f"{hours}h")
     blocks = 0
     warnings = 0
     for event in events:

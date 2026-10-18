@@ -170,6 +170,9 @@ class ExfilGuardRuleChecker(RuleChecker):
 
     def check_safe_default(self, context: GuardContext) -> GuardResult:
         """Conservative fallback: warn on network tools with sensitive args."""
+        finding = self.check(context)
+        if finding.verdict != GuardVerdict.PASS:
+            return finding
         has_network = any(k in context.tool_args for k in _NETWORK_KEYS)
         has_sensitive = any(k.lower() in _SENSITIVE_KEYS for k in context.tool_args)
         if has_network and has_sensitive:

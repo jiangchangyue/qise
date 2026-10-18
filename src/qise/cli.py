@@ -19,8 +19,6 @@ import sys
 from contextlib import suppress
 from typing import Any
 
-from qise.core.models import GuardContext
-
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -73,6 +71,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # qise guards
     guards_parser = subparsers.add_parser("guards", help="List registered guards")
     guards_parser.add_argument("--metrics", action="store_true", help="Show runtime metrics")
+    guards_parser.add_argument("--json", action="store_true", help="Output effective guard policy as JSON")
+    guards_parser.add_argument("--set", nargs=2, metavar=("GUARD", "MODE"), help="Save a mode for all Qise services")
 
     # qise version
     subparsers.add_parser("version", help="Print version")
@@ -107,7 +107,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # qise protect
     protect_parser = subparsers.add_parser("protect", help="Protect an installed Agent")
-    protect_parser.add_argument("agent", help="Agent name: codex, openclaw, claude-code, or custom")
+    protect_parser.add_argument("agent", help="Agent name: codex, openclaw, claude-code, opencode, workbuddy, or custom")
     protect_parser.add_argument("--base-url", default="", help="Upstream/manual base URL for custom Agents")
     protect_parser.add_argument("--experimental", action="store_true", help="Allow experimental integrations")
 
@@ -232,6 +232,7 @@ def _summarize_guard_results_for_event(result: Any) -> list[dict[str, Any]]:
             "verdict": gr.verdict,
             "confidence": gr.confidence,
             "message": gr.message,
+            "evidence_kind": gr.evidence_kind,
         }
         if gr.risk_attribution:
             summary["risk_source"] = gr.risk_attribution.risk_source
@@ -263,7 +264,13 @@ def _record_cli_check_event(args: argparse.Namespace, result: Any, tool_args: di
 
 def _get_shield(config_path: str | None = None):
     from qise.core.shield import Shield
-    return Shield.from_config(config_path)
+    from qise.product.policy import refresh_guard_policy
+    from qise.product.status import load_config
+
+    config, _ = load_config(config_path)
+    shield = Shield(config)
+    refresh_guard_policy(shield)
+    return shield
 
 
 def _cmd_check(args: argparse.Namespace) -> int:
@@ -275,23 +282,15 @@ def _cmd_check(args: argparse.Namespace) -> int:
         print(f"Error: invalid JSON in tool_args: {e}", file=sys.stderr)
         return 1
 
+    from qise.core.models import GuardContext
+
     ctx = GuardContext(
         tool_name=args.tool_name,
         tool_args=tool_args,
         session_id=args.session_id,
     )
 
-    pipeline_map = {
-        "ingress": shield.pipeline.run_ingress,
-        "egress": shield.pipeline.run_egress,
-        "output": shield.pipeline.run_output,
-    }
-    result = pipeline_map[args.pipeline](ctx)
-
-    # Record in session tracker if session_id provided
-    if args.session_id:
-        for gr in result.results:
-            shield.session_tracker.record_guard_result(args.session_id, gr)
+    result = shield.check_sync(ctx, pipeline_kind=args.pipeline)
 
     response: dict = {
         "verdict": result.verdict,
@@ -309,8 +308,12 @@ def _cmd_check(args: argparse.Namespace) -> int:
 
 
 def _cmd_serve(args: argparse.Namespace) -> int:
-    from qise.mcp_server import main as mcp_main
-    asyncio.run(mcp_main())
+    try:
+        from qise.mcp_server import main as mcp_main
+    except ImportError:
+        print('MCP support is optional. Install it with: pip install "qise[mcp]"', file=sys.stderr)
+        return 2
+    asyncio.run(mcp_main(config_path=args.config))
     return 0
 
 
@@ -332,7 +335,18 @@ def _cmd_context(args: argparse.Namespace) -> int:
 
 
 def _cmd_guards(args: argparse.Namespace) -> int:
+    from qise.product.policy import guard_rows, set_guard_mode
+
+    if args.set:
+        try:
+            set_guard_mode(*args.set)
+        except (OSError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
     shield = _get_shield(args.config)
+    if args.json:
+        print(json.dumps(guard_rows(shield), indent=2))
+        return 0
 
     # Header
     print(f"{'Name':<20} {'Pipeline':<10} {'Strategy':<12} {'Mode':<10}")
@@ -443,7 +457,6 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
         print("Press Ctrl+C to stop")
         try:
             # Run forever until interrupted
-            import signal
 
             loop = asyncio.get_event_loop()
             stop_event = asyncio.Event()
@@ -451,8 +464,8 @@ def _cmd_proxy(args: argparse.Namespace) -> int:
             def _signal_handler() -> None:
                 stop_event.set()
 
-            loop.add_signal_handler(signal.SIGINT, _signal_handler)
-            loop.add_signal_handler(signal.SIGTERM, _signal_handler)
+            from qise.product.service import install_stop_handlers
+            install_stop_handlers(loop, stop_event)
 
             await stop_event.wait()
         finally:
@@ -571,8 +584,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
 
 def _cmd_stop(args: argparse.Namespace) -> int:
+    from qise.product.agents import restore_agent
     from qise.product.service import stop_managed_services
 
+    try:
+        code, message = restore_agent("all")
+        if code:
+            print(message, file=sys.stderr)
+            return code
+    except (OSError, ValueError) as exc:
+        print(f"Could not restore Agent settings; Qise was left running: {exc}", file=sys.stderr)
+        return 1
     stopped, notes = stop_managed_services()
     if not stopped and not notes:
         print(
