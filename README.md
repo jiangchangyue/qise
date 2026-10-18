@@ -69,6 +69,8 @@ Qise is local-first. Product state, backups, and events are stored under `~/.qis
 
 Qise is currently an alpha/MVP project. Desktop builds are distributed through GitHub Releases for Windows x64 and macOS Apple Silicon. Tauri updater artifacts are signed, but Windows Authenticode signing and Apple Developer ID notarization are still future release-hardening work.
 
+This repository is a fork of [WhitzardAgent/Qise](https://github.com/WhitzardAgent/qise). Its desktop releases and automatic updates are distributed independently through [jiangchangyue/qise](https://github.com/jiangchangyue/qise/releases).
+
 | Area | What works now | Status |
 | --- | --- | --- |
 | Desktop app | Tauri 2 + React UI over the same Qise CLI/product engine | Source-build MVP |
@@ -88,7 +90,7 @@ The desktop app is the easiest way to try Qise as a product. It gives you pages 
 
 ### Option A: Install A Prebuilt App From GitHub Releases
 
-Open the [latest Qise release](https://github.com/WhitzardAgent/qise/releases/latest) and download:
+Open the [latest Qise release](https://github.com/jiangchangyue/qise/releases/latest) and download:
 
 ```text
 macOS Apple Silicon: Qise_*_aarch64.dmg
@@ -111,14 +113,14 @@ On Windows:
 
 The Windows test installer is not signed yet, so Windows SmartScreen may show an unknown-publisher warning.
 
-This Qise 0.2.0 build is the first updater-enabled build. Users who installed an earlier 0.2.0 build must install this build manually once because automatic updates require a higher version number. Later stable releases are checked after startup. Automatic installation is deferred while protection state is unknown or an agent still has a Qise connection configured, including when its service has stopped. Update status and manual checking are available under `Settings -> Application Update`.
+This fork uses its own update channel and updater signing key. If you installed an upstream build, manually install this fork's Qise 0.2.1 once; the upstream app will not automatically switch to this repository. After that, Qise checks this repository for newer stable releases after startup. Automatic installation is deferred while protection state is unknown or an agent still has a Qise connection configured, including when its service has stopped. Update status and manual checking are available under `Settings -> Application Update`.
 
 ### Option B: Build The macOS App From Source
 
 Run these commands from a terminal:
 
 ```bash
-git clone https://github.com/WhitzardAgent/qise.git
+git clone https://github.com/jiangchangyue/qise.git
 cd qise
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -145,14 +147,14 @@ After a successful build, the important files are:
 
 ```text
 src-tauri/target/release/bundle/macos/Qise.app
-src-tauri/target/release/bundle/dmg/Qise_0.2.0_aarch64.dmg
+src-tauri/target/release/bundle/dmg/Qise_0.2.1_aarch64.dmg
 ```
 
 The exact DMG suffix can vary by version and CPU architecture. On Apple Silicon, it is commonly `aarch64`.
 
 To install the locally built app:
 
-1. Open `src-tauri/target/release/bundle/dmg/Qise_0.2.0_aarch64.dmg`.
+1. Open `src-tauri/target/release/bundle/dmg/Qise_0.2.1_aarch64.dmg`.
 2. Drag `Qise.app` into `Applications`.
 3. Open `Qise.app`.
 
@@ -168,6 +170,21 @@ source .venv/bin/activate
 npm --prefix src-ui install
 src-ui/node_modules/.bin/tauri dev
 ```
+
+### Preview The UI In A Browser
+
+For design review, run the existing React pages without Tauri, the Python backend, proxy services, or a model:
+
+```bash
+npm --prefix src-ui ci # Skip if frontend dependencies are already installed
+npm --prefix src-ui run dev:browser
+```
+
+Open http://127.0.0.1:1420. In a remote SSH / Cursor / VS Code workspace, forward port `1420` in the Ports panel and open its forwarded URL. Use the top-right language button to switch between English and Chinese.
+
+The preview banner identifies sample agents, rules, events, configuration, and diagnostics held in memory. Browse all pages, filter events, and edit forms; real operations such as scanning, enabling protection, and saving configuration are not executed. Refresh to reset the preview. Normal `dev`, `build`, and Tauri workflows continue to use the native APIs.
+
+For a static preview build, run `npm --prefix src-ui run build:browser`, then `npm --prefix src-ui run preview -- --host 127.0.0.1`. Run the normal `build` before packaging the desktop app.
 
 ## First Use In The Desktop App
 
@@ -204,7 +221,7 @@ qise stop
 If you prefer the terminal, install Qise as a Python package. The base package has no model runtime or MCP server dependency; `[proxy]` adds optional config watching:
 
 ```bash
-git clone https://github.com/WhitzardAgent/qise.git
+git clone https://github.com/jiangchangyue/qise.git
 cd qise
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -658,7 +675,7 @@ qise events --limit 5
 
 ## Current Limitations
 
-- The macOS and Windows installers in this repository are currently unsigned test builds.
+- The macOS app is ad-hoc signed without Apple Developer ID notarization, and the Windows installer lacks Authenticode signing. Updater artifacts are signed separately with this fork's updater key.
 - HTTP proxy coverage includes Chat Completions, Anthropic Messages, and supported Responses text/function/custom-tool flows. WebSocket, upstream-hosted tool execution, and unrecognized API routes are outside the execution gate. Streamed text is audited after delivery; see [protocol boundaries](./docs/integration.md#http-protocol-coverage).
 - Healthy service identity and matching configuration do not prove complete agent execution coverage. Project overrides, built-in model paths, and calls that bypass Qise remain outside the proxy.
 - Historical benchmark reports use older metric/mode behavior. Use the corrected [evaluation runner](./eval/README.md); detection F1 is not a blocking-success rate.

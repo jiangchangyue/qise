@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     from qise.core.models import GuardContext, GuardResult, GuardVerdict, PipelineResult, RiskAttribution, TrustBoundary
     from qise.core.shield import Shield
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "Shield",

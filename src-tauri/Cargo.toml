@@ -1,6 +1,6 @@
 [package]
 name = "qise-app"
-version = "0.2.0"
+version = "0.2.1"
 description = "Qise — AI Agent Security Framework"
 authors = ["Qise Team"]
 edition = "2021"

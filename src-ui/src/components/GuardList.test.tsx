@@ -7,6 +7,10 @@ describe("Guard policy controls", () => {
     const html = renderToStaticMarkup(<GuardList locale="en" onSetMode={async () => undefined}
       guards={[{ name: "reasoning", pipeline: "egress/output", mode: "observe", primary_strategy: "ai" }]} />);
     expect(html.match(/>reasoning</g)).toHaveLength(1);
-    expect(html.match(/<button/g)).toHaveLength(3);
+    expect(html.match(/data-guard-mode=/g)).toHaveLength(3);
+    expect(html.match(/data-guard-mode="observe"/g)).toHaveLength(1);
+    expect(html.match(/data-guard-mode="enforce"/g)).toHaveLength(1);
+    expect(html.match(/data-guard-mode="off"/g)).toHaveLength(1);
+    expect(html).toContain('aria-label="reasoning mode"');
   });
 });

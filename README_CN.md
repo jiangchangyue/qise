@@ -69,6 +69,8 @@ Qise 是 local-first 的。默认情况下，产品状态、备份和事件都�
 
 Qise 目前处于 alpha/MVP 阶段。Windows x64 和 macOS Apple Silicon 的桌面构建通过 GitHub Releases 分发。Tauri 自动更新包已经签名，但 Windows Authenticode 签名和 Apple Developer ID 公证仍属于后续发布加固工作。
 
+本仓库基于 [WhitzardAgent/Qise](https://github.com/WhitzardAgent/qise) 分叉开发，桌面安装包和自动更新通过 [jiangchangyue/qise](https://github.com/jiangchangyue/qise/releases) 独立发布。
+
 | 模块 | 当前能力 | 状态 |
 | --- | --- | --- |
 | 桌面应用 | Tauri 2 + React UI，调用同一套 Qise CLI/产品引擎 | 源码构建 MVP |
@@ -88,7 +90,7 @@ Qise 目前处于 alpha/MVP 阶段。Windows x64 和 macOS Apple Silicon 的桌�
 
 ### 方式 A：从 GitHub Releases 安装预构建应用
 
-打开 [Qise 最新 Release](https://github.com/WhitzardAgent/qise/releases/latest)，下载：
+打开 [Qise 最新 Release](https://github.com/jiangchangyue/qise/releases/latest)，下载：
 
 ```text
 macOS Apple Silicon：Qise_*_aarch64.dmg
@@ -111,14 +113,14 @@ Windows：
 
 Windows 测试安装包尚未签名，因此 Windows SmartScreen 可能显示未知发布者警告。
 
-当前 Qise 0.2.0 是第一个包含自动更新器的构建。安装过早期 0.2.0 构建的用户仍需手动覆盖安装一次，因为自动更新只能识别更高的版本号。之后 Qise 会在启动后检查稳定更新；如果保护状态尚未确认，或仍有智能体保留 Qise 接入配置（包括服务已停止的情况），会延迟自动安装和重启。可以在 `设置 -> 应用更新` 查看状态或手动检查。
+本分叉使用独立的更新渠道和自动更新签名密钥。如果安装过上游版本，需要先手动安装本分叉的 Qise 0.2.1；上游应用不会自动切换到本仓库。之后 Qise 会在启动后检查本仓库的更高版本稳定更新；如果保护状态尚未确认，或仍有智能体保留 Qise 接入配置（包括服务已停止的情况），会延迟自动安装和重启。可以在 `设置 -> 应用更新` 查看状态或手动检查。
 
 ### 方式 B：从源码构建 macOS App
 
 在终端运行：
 
 ```bash
-git clone https://github.com/WhitzardAgent/qise.git
+git clone https://github.com/jiangchangyue/qise.git
 cd qise
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -145,14 +147,14 @@ src-ui/node_modules/.bin/tauri build
 
 ```text
 src-tauri/target/release/bundle/macos/Qise.app
-src-tauri/target/release/bundle/dmg/Qise_0.2.0_aarch64.dmg
+src-tauri/target/release/bundle/dmg/Qise_0.2.1_aarch64.dmg
 ```
 
 DMG 文件名中的版本号和 CPU 架构可能会变化。Apple Silicon 上通常是 `aarch64`。
 
 安装本地构建版：
 
-1. 打开 `src-tauri/target/release/bundle/dmg/Qise_0.2.0_aarch64.dmg`。
+1. 打开 `src-tauri/target/release/bundle/dmg/Qise_0.2.1_aarch64.dmg`。
 2. 把 `Qise.app` 拖进 `Applications`。
 3. 打开 `Qise.app`。
 
@@ -168,6 +170,21 @@ source .venv/bin/activate
 npm --prefix src-ui install
 src-ui/node_modules/.bin/tauri dev
 ```
+
+### 仅在浏览器中预览 UI
+
+只评审页面设计时，可以直接运行原有 React 页面，无需启动 Tauri、Python 后端、代理服务或模型：
+
+```bash
+npm --prefix src-ui ci # 已安装前端依赖时可跳过
+npm --prefix src-ui run dev:browser
+```
+
+打开 http://127.0.0.1:1420。远程 SSH / Cursor / VS Code 工作区需在「端口」面板转发 `1420`，然后打开转发地址。页面右上角可以切换中英文。
+
+预览使用内存中的示例智能体、规则、事件、配置与诊断数据，顶部会显示「UI 预览」。可以浏览全部页面、筛选事件和编辑表单；扫描、开启保护、保存配置等真实操作不会执行。刷新即可重置。正常的 `dev`、`build` 和 Tauri 启动流程仍使用真实桌面接口。
+
+需要静态预览产物时，运行 `npm --prefix src-ui run build:browser`，再运行 `npm --prefix src-ui run preview -- --host 127.0.0.1`。打包桌面应用前仍应运行正常的 `build`。
 
 ## 第一次使用桌面应用
 
@@ -204,7 +221,7 @@ qise stop
 如果你更喜欢终端，可以把 Qise 安装成 Python 包。基础依赖不包含模型运行时或 MCP 服务端；`[proxy]` 额外提供配置监听：
 
 ```bash
-git clone https://github.com/WhitzardAgent/qise.git
+git clone https://github.com/jiangchangyue/qise.git
 cd qise
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -655,7 +672,7 @@ qise events --limit 5
 
 ## 当前限制
 
-- 当前仓库中的 macOS 和 Windows 安装包均为未签名测试构建。
+- macOS 应用采用 ad-hoc 签名，尚未经过 Apple Developer ID 公证；Windows 安装包尚无 Authenticode 签名。自动更新包使用本分叉的独立密钥签名。
 - HTTP 代理覆盖 Chat Completions、Anthropic Messages 及受支持的 Responses 文本/函数/自定义工具流程。WebSocket、上游托管工具的实际执行和未识别 API 路由不在执行拦截范围；流式文本交付后才进行输出审计，详见 [协议边界](./docs/integration.md#http-protocol-coverage)。
 - 服务身份健康、配置匹配不等于覆盖智能体的一切执行。项目配置覆盖、内置模型通道和绕过 Qise 的调用仍可能不经过代理。
 - 历史评测采用旧的模式选择和指标口径。请使用修正后的 [评估工具](./eval/README.md)，不要把检测 F1 当作阻断成功率。

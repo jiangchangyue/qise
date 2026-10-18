@@ -13,8 +13,8 @@ export default {
         "qise-yellow": "#8a6a24",
       },
       fontFamily: {
-        sans: ['"Universal Sans Text"', "-apple-system", "BlinkMacSystemFont", '"Segoe UI"', "Arial", "sans-serif"],
-        mono: ['"SFMono-Regular"', '"GeistMono"', "ui-monospace", "monospace"],
+        sans: ["var(--font-sans)"],
+        mono: ["var(--font-mono)"],
       },
     },
   },

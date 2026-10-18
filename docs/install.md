@@ -11,21 +11,23 @@
 
 Download the available desktop installer from:
 
-https://github.com/WhitzardAgent/qise/releases/latest
+https://github.com/jiangchangyue/qise/releases/latest
 
 Supported desktop packages:
 
 - Windows x64 NSIS installer.
 - macOS Apple Silicon DMG.
 
-This Qise 0.2.0 build is the first updater-enabled build. Users on an earlier 0.2.0 build must install it manually once because automatic updates require a higher version number. Later releases check after startup. Installation is deferred when status is unknown or an agent still has a Qise connection configured, including when services are stopped.
+This fork of [WhitzardAgent/Qise](https://github.com/WhitzardAgent/qise) uses an independent update channel and updater signing key. Users of upstream builds must manually install this fork's Qise 0.2.1 once; upstream installations do not automatically switch channels. Later updates are checked against `jiangchangyue/qise` after startup. Installation is deferred when status is unknown or an agent still has a Qise connection configured, including when services are stopped.
+
+The macOS app is ad-hoc signed but not notarized by Apple; the Windows installer lacks Authenticode signing. System prompts on first installation are separate from the signatures used to verify automatic updates.
 
 ## Source Install
 
-Recommended before the first PyPI release:
+Install this fork's CLI from source:
 
 ```bash
-git clone https://github.com/WhitzardAgent/qise.git
+git clone https://github.com/jiangchangyue/qise.git
 cd qise
 python3.11 -m venv .venv
 source .venv/bin/activate
@@ -51,15 +53,9 @@ pip install -e ".[dev,proxy]"
 pytest tests
 ```
 
-## pipx After Release
+## PyPI And This Fork
 
-Once Qise is published to PyPI, the intended command is:
-
-```bash
-pipx install qise
-```
-
-Until then, use the source install above. A Git-based pipx install may work, but source install is easier to inspect and debug during the MVP phase.
+This fork does not publish the upstream `qise` package to PyPI. Use this repository's desktop installers or the source installation above to test its changes. `pipx install qise` uses the package on PyPI and does not select this fork.
 
 ## Verify
 

@@ -1,6 +1,6 @@
 {
   "productName": "Qise",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "com.qise.desktop",
   "build": {
     "frontendDist": "../src-ui/dist",
@@ -18,10 +18,10 @@
     "windows": [
       {
         "title": "Qise — AI Agent Security",
-        "width": 800,
-        "height": 600,
-        "minWidth": 600,
-        "minHeight": 400,
+        "width": 1120,
+        "height": 760,
+        "minWidth": 900,
+        "minHeight": 640,
         "center": true,
         "resizable": true,
         "fullscreen": false
@@ -48,9 +48,9 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDg2RjRFRkNCMTlCRUNDRDAKUldUUXpMNFp5Ky8waHZZKzgzLyt1NXJhZUx6THd5QTRnMEJCYnFXb3NYdWFWNjJPSFVKZnpyeVEK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDYxNjMwMkQ1QTlBNkYxQjAKUldTdzhhYXAxUUpqWVh1UUJrc250LzExUllTNmdzZE1vcEpwbnJ2eEg5QWJPeW1lZkZtQVdTazQK",
       "endpoints": [
-        "https://github.com/WhitzardAgent/qise/releases/latest/download/latest.json"
+        "https://github.com/jiangchangyue/qise/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"
